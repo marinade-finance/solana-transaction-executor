@@ -186,6 +186,16 @@ pub struct SendTransactionWithGrowingTipProvider {
     pub query_param: String,
 }
 
+impl Default for SendTransactionWithGrowingTipProvider {
+    fn default() -> Self {
+        Self {
+            rpc_url: Default::default(),
+            tip_policy: Default::default(),
+            query_param: "tip".into(),
+        }
+    }
+}
+
 #[async_trait]
 impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
     async fn send_transaction(

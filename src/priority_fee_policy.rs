@@ -13,11 +13,21 @@ impl PriorityFeeConfiguration {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PriorityFeePolicy {
     pub micro_lamports_per_cu_min: u64,
     pub micro_lamports_per_cu_max: u64,
     pub multiplier_per_attempt: u64,
+}
+
+impl Default for PriorityFeePolicy {
+    fn default() -> Self {
+        Self {
+            micro_lamports_per_cu_min: 1000,
+            micro_lamports_per_cu_max: 100000,
+            multiplier_per_attempt: 2,
+        }
+    }
 }
 
 impl PriorityFeePolicy {
