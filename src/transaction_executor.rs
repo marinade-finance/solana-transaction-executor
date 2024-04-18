@@ -53,7 +53,7 @@ impl TransactionExecutor {
     ) {
         let signature_statuses_provider = self.signature_statuses_provider.clone();
         tokio::spawn(async move {
-            loop {
+            while !sender_transaction_exectuted.is_closed() {
                 sleep(Duration::from_secs(1)).await;
 
                 let mut failed_signatures = vec![];
