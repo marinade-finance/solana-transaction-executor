@@ -51,8 +51,5 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: 🏗️ Build TypeScript projects
-        run: cargo build
-
       - name: 🧭 Run cargo lint
         run: cargo fmt -- --check && cargo clippy -- -D warnings

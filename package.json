@@ -12,8 +12,8 @@
   },
   "lint-staged": {
     "*.rs": [
-      "cargo fmt -- --check"
+      "cargo fmt --"
     ],
-    "Cargo.toml": "cargo fmt -- --check"
+    "Cargo.toml": "cargo fmt --"
   }
 }
