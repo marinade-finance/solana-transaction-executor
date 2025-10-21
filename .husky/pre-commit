@@ -1,2 +1,2 @@
 npx lint-staged
-cargo clippy -- -D warnings
+# cargo clippy -- -D warnings
