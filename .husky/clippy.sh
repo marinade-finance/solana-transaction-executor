@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
+set -e
 
 # Get list of changed Rust files (relative to repo root)
-CHANGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$')
+CHANGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 
 if [ -z "$CHANGED_RS_FILES" ]; then
   echo "No Rust files changed, skipping clippy"
@@ -23,13 +24,13 @@ cargo metadata --no-deps --format-version 1 | \
       # Root package - any changed Rust file affects it
       if [ -n "$CHANGED_RS_FILES" ]; then
         echo "Running clippy on: $name"
-        cargo clippy -p "$name" -- -D warnings || exit 1
+        cargo clippy -p "$name" -- -D warnings
       fi
     else
       # Check if any changed file starts with this package's directory
       if echo "$CHANGED_RS_FILES" | grep -q "^$pkg_rel_dir/"; then
         echo "Running clippy on: $name"
-        cargo clippy -p "$name" -- -D warnings || exit 1
+        cargo clippy -p "$name" -- -D warnings
       fi
     fi
   done
