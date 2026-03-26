@@ -17,11 +17,11 @@ env:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: 🚧 Checkout project
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: ⚙️ Install rust compilation dependencies
         run: |
@@ -29,17 +29,17 @@ jobs:
           sudo apt-get -y install libudev-dev
 
       - name: 👨‍🔧 Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: 20
 
       - name: 🦿 Install Rust tookchain
-        uses: dtolnay/rust-toolchain@1.83.0
+        uses: dtolnay/rust-toolchain@c82636ac6f859942c6f571692f3880cf1d0fc5b0 # 1.83.0
         with:
           components: rustfmt, clippy
 
       - name: 🧠 Cache Rust dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
             ~/.cargo/bin/
