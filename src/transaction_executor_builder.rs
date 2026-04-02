@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use log::info;
 use serde_json::json;
 use solana_client::{
@@ -213,7 +214,7 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
                 "id": 1,
                 "method": "sendTransaction",
                 "params": [
-                    base64::encode(bincode::serialize(transaction)?),
+                    base64::engine::general_purpose::STANDARD.encode(bincode::serialize(transaction)?),
                     {
                         "encoding": "base64",
                         "skipPreflight": true,

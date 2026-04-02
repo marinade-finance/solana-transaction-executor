@@ -140,7 +140,8 @@ impl TransactionExecutor {
                 })?
                 .value;
 
-            if let Some(err) = simulation_response.err {
+            if let Some(ui_err) = simulation_response.err {
+                let err = TransactionError::from(ui_err);
                 match err {
                     TransactionError::AlreadyProcessed => {
                         log::info!("Transaction {attempt_signature} has already been processed!");
@@ -178,7 +179,7 @@ impl TransactionExecutor {
                 signatures
                     .write()
                     .await
-                    .push(transaction.get_signature().clone());
+                    .push(*transaction.get_signature());
             }
 
             tokio::select! {

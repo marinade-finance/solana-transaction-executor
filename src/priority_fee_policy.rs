@@ -1,4 +1,5 @@
-use solana_sdk::{compute_budget::ComputeBudgetInstruction, instruction::Instruction};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_sdk::instruction::Instruction;
 
 #[derive(Clone, Debug, Default)]
 pub struct PriorityFeeConfiguration {
