@@ -1,7 +1,6 @@
 # solana-transaction-executor
 
-For executor depending on various versions of Solana,
-refer to tags.
+For the executor version compatible with different Solana versions, see the tags below.
 
 * [`solana-1.14.x`](https://github.com/marinade-finance/solana-transaction-executor/releases/tag/solana-1.14.x) (currently in `master` branch)
 * [`solana-1.18.x`](https://github.com/marinade-finance/solana-transaction-executor/releases/tag/solana-1.18.x)
