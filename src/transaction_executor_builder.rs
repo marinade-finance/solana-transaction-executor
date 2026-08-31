@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use log::info;
-use serde_json::json;
+use serde_json::{json, Value};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_client::SerializableTransaction,
@@ -225,10 +225,26 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
             .await?;
 
         let status = response.status();
-        let body = response.text().await;
+        let body = response.text().await?;
+        let signature = *transaction.get_signature();
 
-        info!("Transaction sent with tip {tip}, rpc response: {status} {body:?}");
+        if !status.is_success() {
+            anyhow::bail!(
+                "Sender RPC refused {signature} sent with tip {tip}: HTTP {status}, body: {body}"
+            );
+        }
 
-        Ok(*transaction.get_signature())
+        let rpc_response: Value = serde_json::from_str(&body).map_err(|err| {
+            anyhow::anyhow!(
+                "Sender RPC response for {signature} is not a JSON: {err}, body: {body}"
+            )
+        })?;
+        if let Some(error) = rpc_response.get("error") {
+            anyhow::bail!("Sender RPC refused {signature} sent with tip {tip}: {error}");
+        }
+
+        info!("Transaction {signature} sent with tip {tip}, rpc response: {status} {body}");
+
+        Ok(signature)
     }
 }
