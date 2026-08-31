@@ -176,10 +176,7 @@ impl TransactionExecutor {
                         "RPC error while sending the transaction {attempt_signature}: {err}"
                     );
                 }
-                signatures
-                    .write()
-                    .await
-                    .push(*transaction.get_signature());
+                signatures.write().await.push(*transaction.get_signature());
             }
 
             tokio::select! {
