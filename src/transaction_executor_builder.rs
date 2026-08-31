@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine;
-use log::info;
+use log::{info, warn};
 use serde_json::{json, Value};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
@@ -239,8 +239,16 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
                 "Sender RPC response for {signature} is not a JSON: {err}, body: {body}"
             )
         })?;
-        if let Some(error) = rpc_response.get("error") {
+        if let Some(error) = rpc_response.get("error").filter(|error| !error.is_null()) {
             anyhow::bail!("Sender RPC refused {signature} sent with tip {tip}: {error}");
+        }
+        // Warn, not bail: the relay's success envelope is unverified and a hard reject would fail every send.
+        if rpc_response
+            .get("result")
+            .filter(|result| !result.is_null())
+            .is_none()
+        {
+            warn!("Sender RPC response for {signature} has neither result nor error");
         }
 
         info!("Transaction {signature} sent with tip {tip}, rpc response: {status} {body}");
