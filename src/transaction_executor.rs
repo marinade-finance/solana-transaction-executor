@@ -205,7 +205,7 @@ impl TransactionExecutor {
             executed_signature = receiver_transaction_executed.recv() => {
                 if let Some(executed_signature) = executed_signature {
                     log::info!("Transaction {executed_signature} successfully executed!");
-                    return Ok(executed_signature)
+                    Ok(executed_signature)
                 } else {
                     anyhow::bail!("No transaction executed")
                 }

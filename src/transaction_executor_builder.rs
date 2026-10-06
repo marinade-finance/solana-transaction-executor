@@ -136,12 +136,8 @@ impl SignatureStatusesProvider for DefaultProvider {
             .value
             .into_iter()
             .map(|transaction_status| {
-                transaction_status.and_then(|transaction_status| {
-                    if transaction_status.satisfies_commitment(self.rpc_client.commitment()) {
-                        Some(transaction_status)
-                    } else {
-                        None
-                    }
+                transaction_status.filter(|transaction_status| {
+                    transaction_status.satisfies_commitment(self.rpc_client.commitment())
                 })
             })
             .collect();
