@@ -3,13 +3,13 @@ use futures_core::stream::Stream;
 use futures_core::{self};
 use futures_util::stream::StreamExt;
 use solana_client::rpc_client::SerializableTransaction;
-use solana_sdk::{
-    signature::Signature,
-    transaction::{TransactionError, VersionedTransaction},
-};
-use solana_transaction_status::TransactionStatus;
+use solana_hash::Hash;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_error::TransactionError;
+use solana_transaction_status_client_types::TransactionStatus;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{sync::RwLock, time::sleep};
 
 use crate::{
@@ -23,6 +23,11 @@ pub type TransactionBuilderResult =
 pub struct RetryPolicy {}
 
 impl RetryPolicy {}
+
+enum AttemptOutcome {
+    Executed(Signature),
+    ReadyForNextAttempt,
+}
 
 pub struct TransactionExecutor {
     pub transaction_executor_config: TransactionExecutorConfig,
@@ -58,6 +63,9 @@ impl TransactionExecutor {
 
                 let mut failed_signatures = vec![];
                 let pending_signatures = signatures.read().await.clone();
+                if pending_signatures.is_empty() {
+                    continue;
+                }
                 let statuses = match signature_statuses_provider
                     .get_signature_statuses(&pending_signatures)
                     .await
@@ -140,8 +148,8 @@ impl TransactionExecutor {
                 })?
                 .value;
 
-            if let Some(ui_err) = simulation_response.err {
-                let err = TransactionError::from(ui_err);
+            if let Some(err) = simulation_response.err {
+                let err = err.into();
                 match err {
                     TransactionError::AlreadyProcessed => {
                         log::info!("Transaction {attempt_signature} has already been processed!");
@@ -179,19 +187,18 @@ impl TransactionExecutor {
                 signatures.write().await.push(*transaction.get_signature());
             }
 
-            tokio::select! {
-                executed_signature = receiver_transaction_executed.recv() => {
-                    if let Some(executed_signature) = executed_signature {
-                        log::info!("Transaction {executed_signature} successfully executed!");
-                        return Ok(executed_signature)
-                    } else {
-                        log::info!("No transaction has been verified");
-                    }
-                }
-                _ = sleep(self.transaction_executor_config.transaction_send_interval) => {
-                    log::info!("Attempt {attempt_signature} timeout");
-                    continue
-                }
+            // Hold retry until previous attempt's blockhash is invalid, see "Orphaned Revoke Tokens"
+            let attempt_blockhash = *transaction.message.recent_blockhash();
+            match self
+                .wait_for_attempt_outcome(
+                    &attempt_blockhash,
+                    attempt_signature,
+                    &mut receiver_transaction_executed,
+                )
+                .await?
+            {
+                AttemptOutcome::Executed(executed_signature) => return Ok(executed_signature),
+                AttemptOutcome::ReadyForNextAttempt => {}
             }
         }
 
@@ -211,6 +218,59 @@ impl TransactionExecutor {
                 }
             }
             _ = sleep(self.transaction_executor_config.waiting_time_after_last_send) => anyhow::bail!("No transaction executed up until now, timeouting")
+        }
+    }
+
+    async fn wait_for_attempt_outcome(
+        &self,
+        attempt_blockhash: &Hash,
+        attempt_signature: &Signature,
+        receiver_transaction_executed: &mut UnboundedReceiver<Signature>,
+    ) -> anyhow::Result<AttemptOutcome> {
+        let mut blockhash_check_failures: u32 = 0;
+        loop {
+            tokio::select! {
+                executed_signature = receiver_transaction_executed.recv() => {
+                    if let Some(executed_signature) = executed_signature {
+                        log::info!("Transaction {executed_signature} successfully executed!");
+                        return Ok(AttemptOutcome::Executed(executed_signature));
+                    } else {
+                        log::info!("No transaction has been verified");
+                        return Ok(AttemptOutcome::ReadyForNextAttempt);
+                    }
+                }
+                _ = sleep(self.transaction_executor_config.transaction_send_interval) => {
+                    if !self.transaction_executor_config.wait_for_blockhash_expiry_before_retry {
+                        log::info!("Attempt {attempt_signature} timeout (race-unsafe mode, blockhash check disabled)");
+                        return Ok(AttemptOutcome::ReadyForNextAttempt);
+                    }
+                    match self.signature_statuses_provider.is_blockhash_valid(attempt_blockhash).await {
+                        Ok(true) => {
+                            blockhash_check_failures = 0;
+                            log::info!(
+                                "Attempt {attempt_signature} not confirmed yet but blockhash still valid; holding before retry to avoid duplicate landing"
+                            );
+                        }
+                        Ok(false) => {
+                            log::info!("Attempt {attempt_signature} blockhash expired; safe to rebuild with a fresh blockhash");
+                            return Ok(AttemptOutcome::ReadyForNextAttempt);
+                        }
+                        Err(err) => {
+                            blockhash_check_failures += 1;
+                            let budget = self.transaction_executor_config.max_consecutive_blockhash_check_failures;
+                            if blockhash_check_failures >= budget {
+                                // Bail (not break) so the outer loop does NOT rebuild and risk a duplicate landing of a non-idempotent op.
+                                anyhow::bail!(
+                                    "aborting execution: is_blockhash_valid failed {blockhash_check_failures} consecutive times for {attempt_signature}: {err}"
+                                );
+                            }
+                            log::warn!(
+                                "is_blockhash_valid check failed for {attempt_signature} ({blockhash_check_failures}/{budget}): {err}; holding rather than rebuilding to be safe"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

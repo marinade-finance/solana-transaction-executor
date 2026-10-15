@@ -3,21 +3,11 @@ pub struct TipConfiguration {
     pub tip: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TipPolicy {
     pub tip_min: u64,
     pub tip_max: u64,
     pub multiplier_per_attempt: u64,
-}
-
-impl Default for TipPolicy {
-    fn default() -> Self {
-        Self {
-            tip_min: 1000,
-            tip_max: 200000,
-            multiplier_per_attempt: 4,
-        }
-    }
 }
 
 impl TipPolicy {

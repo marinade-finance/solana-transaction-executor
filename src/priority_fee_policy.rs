@@ -1,5 +1,5 @@
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_sdk::instruction::Instruction;
+use solana_instruction::Instruction;
 
 #[derive(Clone, Debug, Default)]
 pub struct PriorityFeeConfiguration {
@@ -14,21 +14,11 @@ impl PriorityFeeConfiguration {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PriorityFeePolicy {
     pub micro_lamports_per_cu_min: u64,
     pub micro_lamports_per_cu_max: u64,
     pub multiplier_per_attempt: u64,
-}
-
-impl Default for PriorityFeePolicy {
-    fn default() -> Self {
-        Self {
-            micro_lamports_per_cu_min: 1000,
-            micro_lamports_per_cu_max: 100000,
-            multiplier_per_attempt: 2,
-        }
-    }
 }
 
 impl PriorityFeePolicy {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use base64::Engine;
+use base64::{prelude::BASE64_STANDARD, Engine};
 use log::{info, warn};
 use serde_json::{json, Value};
 use solana_client::{
@@ -8,8 +8,10 @@ use solana_client::{
     rpc_config::RpcSendTransactionConfig,
     rpc_response::{RpcResult, RpcSimulateTransactionResult},
 };
-use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
-use solana_transaction_status::TransactionStatus;
+use solana_hash::Hash;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_status_client_types::TransactionStatus;
 use std::sync::Arc;
 
 use crate::{TipPolicy, TransactionExecutor, TransactionExecutorConfig};
@@ -83,6 +85,24 @@ impl TransactionExecutorBuilder {
             send_transaction_provider,
         )
     }
+
+    pub fn initialize(
+        rpc_client: Arc<RpcClient>,
+        sender_rpc_url: Option<String>,
+        tip_policy: Option<TipPolicy>,
+    ) -> Self {
+        if let Some(rpc_url) = sender_rpc_url {
+            TransactionExecutorBuilder::new()
+                .with_default_providers(rpc_client)
+                .with_send_transaction_provider(SendTransactionWithGrowingTipProvider {
+                    rpc_url,
+                    query_param: "tip".into(),
+                    tip_policy: tip_policy.unwrap_or_default(),
+                })
+        } else {
+            TransactionExecutorBuilder::new().with_default_providers(rpc_client.clone())
+        }
+    }
 }
 
 #[async_trait]
@@ -91,6 +111,7 @@ pub trait SignatureStatusesProvider {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>>;
+    async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -144,6 +165,13 @@ impl SignatureStatusesProvider for DefaultProvider {
 
         Ok(result)
     }
+
+    async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool> {
+        Ok(self
+            .rpc_client
+            .is_blockhash_valid(blockhash, self.rpc_client.commitment())
+            .await?)
+    }
 }
 
 #[async_trait]
@@ -169,7 +197,7 @@ impl SendTransactionProvider for DefaultProvider {
                 transaction,
                 RpcSendTransactionConfig {
                     skip_preflight: true,
-                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+                    encoding: Some(solana_client::rpc_config::UiTransactionEncoding::Base64),
                     ..Default::default()
                 },
             )
@@ -181,16 +209,6 @@ pub struct SendTransactionWithGrowingTipProvider {
     pub rpc_url: String,
     pub tip_policy: TipPolicy,
     pub query_param: String,
-}
-
-impl Default for SendTransactionWithGrowingTipProvider {
-    fn default() -> Self {
-        Self {
-            rpc_url: Default::default(),
-            tip_policy: Default::default(),
-            query_param: "tip".into(),
-        }
-    }
 }
 
 #[async_trait]
@@ -210,7 +228,7 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
                 "id": 1,
                 "method": "sendTransaction",
                 "params": [
-                    base64::engine::general_purpose::STANDARD.encode(bincode::serialize(transaction)?),
+                    wire_base64(transaction)?,
                     {
                         "encoding": "base64",
                         "skipPreflight": true,
@@ -250,5 +268,35 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
         info!("Transaction {signature} sent with tip {tip}, rpc response: {status} {body}");
 
         Ok(signature)
+    }
+}
+
+fn wire_base64(transaction: &VersionedTransaction) -> anyhow::Result<String> {
+    Ok(BASE64_STANDARD.encode(wincode::serialize(transaction)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_keypair::Keypair;
+    use solana_message::{v1, VersionedMessage};
+    use solana_signer::Signer;
+
+    #[test]
+    fn a_v1_transaction_is_sent_in_its_wire_format() {
+        let payer = Keypair::new();
+        let message = v1::Message::try_compile(&payer.pubkey(), &[], Hash::new_unique()).unwrap();
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer]).unwrap();
+
+        let wire = BASE64_STANDARD
+            .decode(wire_base64(&transaction).unwrap())
+            .unwrap();
+
+        assert_eq!(wire[0], v1::V1_PREFIX);
+        assert_eq!(
+            wincode::deserialize::<VersionedTransaction>(&wire).unwrap(),
+            transaction
+        );
     }
 }
