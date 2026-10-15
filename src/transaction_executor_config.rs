@@ -14,7 +14,7 @@ impl Default for TransactionExecutorConfig {
         Self {
             signature_status_check_interval: Duration::from_secs(1),
             transaction_send_interval: Duration::from_secs(20),
-            waiting_time_after_last_send: Duration::from_secs(60),
+            waiting_time_after_last_send: Duration::from_secs(120),
             max_attempts: 10,
             wait_for_blockhash_expiry_before_retry: true,
             max_consecutive_blockhash_check_failures: 5,

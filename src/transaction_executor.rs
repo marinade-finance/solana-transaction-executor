@@ -8,7 +8,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::TransactionStatus;
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{sync::RwLock, time::sleep};
 
@@ -60,9 +60,12 @@ impl TransactionExecutor {
         sender_transaction_exectuted: UnboundedSender<Signature>,
     ) {
         let signature_statuses_provider = self.signature_statuses_provider.clone();
+        let interval = self
+            .transaction_executor_config
+            .signature_status_check_interval;
         tokio::spawn(async move {
             while !sender_transaction_exectuted.is_closed() {
-                sleep(Duration::from_secs(1)).await;
+                sleep(interval).await;
 
                 let mut failed_signatures = vec![];
                 let pending_signatures = signatures.read().await.clone();

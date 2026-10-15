@@ -8,6 +8,7 @@ use solana_client::{
     rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
     rpc_response::{RpcResult, RpcSimulateTransactionResult},
 };
+use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -126,8 +127,14 @@ pub trait SignatureStatusesProvider {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>>;
+    /// Searches the ledger too, and keeps a status below the commitment.
+    async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>>;
     async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool>;
     async fn latest_blockhash(&self) -> anyhow::Result<Hash>;
+    fn commitment(&self) -> CommitmentConfig;
 }
 
 #[async_trait]
@@ -200,6 +207,19 @@ impl SignatureStatusesProvider for DefaultProvider {
 
     async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
         Ok(self.rpc_client.get_latest_blockhash().await?)
+    }
+
+    async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.rpc_client
+            .get_signature_statuses_with_history(signatures)
+            .await
+    }
+
+    fn commitment(&self) -> CommitmentConfig {
+        self.rpc_client.commitment()
     }
 }
 

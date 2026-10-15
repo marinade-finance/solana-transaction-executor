@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use solana_client::rpc_response::{
     Response, RpcResponseContext, RpcResult, RpcSimulateTransactionResult,
 };
+use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -99,6 +100,17 @@ impl SignatureStatusesProvider for Fake {
 
     async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
         unreachable!("no test reads a blockhash through the fake")
+    }
+
+    async fn get_signature_statuses_with_history(
+        &self,
+        _signatures: &[Signature],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        unreachable!("no test reads a status through the fake")
+    }
+
+    fn commitment(&self) -> CommitmentConfig {
+        CommitmentConfig::finalized()
     }
 }
 
