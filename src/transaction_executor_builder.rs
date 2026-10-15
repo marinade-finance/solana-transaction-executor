@@ -363,7 +363,13 @@ mod tests {
     #[test]
     fn a_v1_transaction_is_sent_in_its_wire_format() {
         let payer = Keypair::new();
-        let message = v1::Message::try_compile(&payer.pubkey(), &[], Hash::new_unique()).unwrap();
+        let message = v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &[],
+            Hash::new_unique(),
+            v1::TransactionConfig::empty(),
+        )
+        .unwrap();
         let transaction =
             VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer]).unwrap();
 

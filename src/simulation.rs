@@ -49,7 +49,13 @@ mod tests {
 
     fn transaction() -> VersionedTransaction {
         let payer = Keypair::new();
-        let message = v1::Message::try_compile(&payer.pubkey(), &[], Hash::default()).unwrap();
+        let message = v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &[],
+            Hash::default(),
+            v1::TransactionConfig::empty(),
+        )
+        .unwrap();
         VersionedTransaction {
             signatures: vec![Signature::default()],
             message: VersionedMessage::V1(message),

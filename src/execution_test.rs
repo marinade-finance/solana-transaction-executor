@@ -202,7 +202,13 @@ fn config() -> TransactionExecutorConfig {
 
 fn attempt(n: u8) -> VersionedTransaction {
     let payer = Pubkey::new_unique();
-    let message = v1::Message::try_compile(&payer, &[], Hash::new_unique()).unwrap();
+    let message = v1::Message::try_compile_with_config(
+        &payer,
+        &[],
+        Hash::new_unique(),
+        v1::TransactionConfig::empty(),
+    )
+    .unwrap();
     VersionedTransaction {
         signatures: vec![Signature::from([n; 64])],
         message: VersionedMessage::V1(message),
