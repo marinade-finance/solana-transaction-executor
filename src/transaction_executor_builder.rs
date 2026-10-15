@@ -9,6 +9,7 @@ use solana_client::{
     rpc_response::{RpcResult, RpcSimulateTransactionResult},
 };
 use solana_hash::Hash;
+use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status_client_types::TransactionStatus;
@@ -22,6 +23,7 @@ pub struct TransactionExecutorBuilder {
     signature_statuses_provider: Option<Arc<dyn SignatureStatusesProvider + Send + Sync>>,
     simulate_transaction_provider: Option<Arc<dyn SimulateTransactionProvider + Send + Sync>>,
     send_transaction_provider: Option<Arc<dyn SendTransactionProvider + Send + Sync>>,
+    prioritization_fees_provider: Option<Arc<dyn PrioritizationFeesProvider + Send + Sync>>,
 }
 
 impl TransactionExecutorBuilder {
@@ -41,6 +43,7 @@ impl TransactionExecutorBuilder {
         self.with_signature_statuses_provider(DefaultProvider::new(rpc_client.clone()))
             .with_simulate_transaction_provider(DefaultProvider::new(rpc_client.clone()))
             .with_send_transaction_provider(DefaultProvider::new(rpc_client.clone()))
+            .with_prioritization_fees_provider(DefaultProvider::new(rpc_client.clone()))
     }
 
     pub fn with_signature_statuses_provider(
@@ -67,6 +70,14 @@ impl TransactionExecutorBuilder {
         self
     }
 
+    pub fn with_prioritization_fees_provider(
+        mut self,
+        provider: impl PrioritizationFeesProvider + Send + Sync + 'static,
+    ) -> Self {
+        self.prioritization_fees_provider = Some(Arc::new(provider));
+        self
+    }
+
     pub fn build(self) -> TransactionExecutor {
         let signature_statuses_provider = self
             .signature_statuses_provider
@@ -77,12 +88,16 @@ impl TransactionExecutorBuilder {
         let send_transaction_provider = self
             .send_transaction_provider
             .expect("Send transaction provider not set");
+        let prioritization_fees_provider = self
+            .prioritization_fees_provider
+            .expect("Prioritization fees provider not set");
 
         TransactionExecutor::new(
             self.transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
             send_transaction_provider,
+            prioritization_fees_provider,
         )
     }
 
@@ -124,6 +139,11 @@ pub trait SimulateTransactionProvider {
         &self,
         transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult>;
+}
+
+#[async_trait]
+pub trait PrioritizationFeesProvider {
+    async fn recent_prioritization_fees(&self, writable: &[Pubkey]) -> anyhow::Result<Vec<u64>>;
 }
 
 pub struct SendTransactionMeta {
@@ -201,6 +221,19 @@ impl SimulateTransactionProvider for DefaultProvider {
                 },
             )
             .await
+    }
+}
+
+#[async_trait]
+impl PrioritizationFeesProvider for DefaultProvider {
+    async fn recent_prioritization_fees(&self, writable: &[Pubkey]) -> anyhow::Result<Vec<u64>> {
+        Ok(self
+            .rpc_client
+            .get_recent_prioritization_fees(writable)
+            .await?
+            .into_iter()
+            .map(|fee| fee.prioritization_fee)
+            .collect())
     }
 }
 

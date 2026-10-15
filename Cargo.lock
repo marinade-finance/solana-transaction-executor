@@ -4704,6 +4704,7 @@ dependencies = [
  "solana-instruction",
  "solana-keypair",
  "solana-message",
+ "solana-pubkey 4.2.1",
  "solana-signature",
  "solana-signer",
  "solana-transaction",

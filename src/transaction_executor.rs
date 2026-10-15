@@ -13,8 +13,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{sync::RwLock, time::sleep};
 
 use crate::{
-    SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
-    SimulateTransactionProvider, TransactionExecutorConfig,
+    PrioritizationFeesProvider, SendTransactionMeta, SendTransactionProvider,
+    SignatureStatusesProvider, SimulateTransactionProvider, TransactionExecutorConfig,
 };
 
 pub type TransactionBuilderResult =
@@ -34,6 +34,7 @@ pub struct TransactionExecutor {
     pub signature_statuses_provider: Arc<dyn SignatureStatusesProvider + Send + Sync>,
     pub simulate_transaction_provider: Arc<dyn SimulateTransactionProvider + Send + Sync>,
     pub send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
+    pub prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
 }
 
 impl TransactionExecutor {
@@ -42,12 +43,14 @@ impl TransactionExecutor {
         signature_statuses_provider: Arc<dyn SignatureStatusesProvider + Send + Sync>,
         simulate_transaction_provider: Arc<dyn SimulateTransactionProvider + Send + Sync>,
         send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
+        prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
     ) -> Self {
         Self {
             transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
             send_transaction_provider,
+            prioritization_fees_provider,
         }
     }
 

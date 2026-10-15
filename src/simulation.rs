@@ -31,81 +31,16 @@ impl TransactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
-        SimulateTransactionProvider, TransactionExecutorConfig,
-    };
-    use async_trait::async_trait;
-    use solana_client::rpc_response::{
-        Response, RpcResponseContext, RpcResult, RpcSimulateTransactionResult,
-    };
+    use crate::fake::Fake;
     use solana_hash::Hash;
     use solana_instruction::error::InstructionError;
     use solana_keypair::Keypair;
     use solana_message::{v1, VersionedMessage};
     use solana_signature::Signature;
     use solana_signer::Signer;
-    use solana_transaction_status_client_types::TransactionStatus;
-    use std::sync::Arc;
-
-    struct Simulated(serde_json::Value);
-
-    #[async_trait]
-    impl SimulateTransactionProvider for Simulated {
-        async fn simulate_transaction(
-            &self,
-            _transaction: &VersionedTransaction,
-        ) -> RpcResult<RpcSimulateTransactionResult> {
-            unreachable!("only the unsigned simulation is under test")
-        }
-
-        async fn simulate_unsigned_transaction(
-            &self,
-            _transaction: &VersionedTransaction,
-        ) -> RpcResult<RpcSimulateTransactionResult> {
-            Ok(Response {
-                context: RpcResponseContext {
-                    slot: 1,
-                    api_version: None,
-                },
-                value: serde_json::from_value(self.0.clone()).unwrap(),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl SignatureStatusesProvider for Simulated {
-        async fn get_signature_statuses(
-            &self,
-            _signatures: &[Signature],
-        ) -> RpcResult<Vec<Option<TransactionStatus>>> {
-            unreachable!("simulation reads no status")
-        }
-
-        async fn is_blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
-            unreachable!("simulation reads no blockhash")
-        }
-    }
-
-    #[async_trait]
-    impl SendTransactionProvider for Simulated {
-        async fn send_transaction(
-            &self,
-            _transaction: &VersionedTransaction,
-            _meta: SendTransactionMeta,
-        ) -> anyhow::Result<Signature> {
-            unreachable!("simulation sends nothing")
-        }
-    }
 
     fn executor(result: serde_json::Value) -> TransactionExecutor {
-        let provider = Arc::new(Simulated(result));
-        TransactionExecutor::new(
-            TransactionExecutorConfig::default(),
-            provider.clone(),
-            provider.clone(),
-            provider,
-        )
+        Fake::simulating(result).executor()
     }
 
     fn transaction() -> VersionedTransaction {
