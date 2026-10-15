@@ -79,6 +79,12 @@ impl FeePolicy {
     }
 }
 
+/// The v1 `priority_fee` in lamports for a micro-lamports/CU rate, rounded as a legacy price is.
+pub fn priority_fee_lamports(micro_lamports_per_cu: u64, compute_unit_limit: u32) -> u64 {
+    let micro_lamports = u128::from(micro_lamports_per_cu) * u128::from(compute_unit_limit);
+    u64::try_from(micro_lamports.div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
 impl TransactionExecutor {
     pub async fn next_rate(&self, policy: &FeePolicy, previous: u64, writable: &[Pubkey]) -> u64 {
         let network = match policy.strategy {
@@ -152,6 +158,16 @@ mod tests {
         assert_eq!(PriorityLevel::UnsafeMax.of(&fees), Some(9_000));
         assert_eq!(PriorityLevel::Medium.of(&[0, 0]), None);
         assert_eq!(PriorityLevel::Medium.of(&[]), None);
+    }
+
+    #[test]
+    fn a_rate_over_a_limit_is_its_total_in_lamports_rounded_up() {
+        assert_eq!(priority_fee_lamports(1_000, 200_000), 200);
+        assert_eq!(priority_fee_lamports(1, 1), 1);
+        assert_eq!(priority_fee_lamports(1_500_000, 3), 5);
+        assert_eq!(priority_fee_lamports(0, 1_400_000), 0);
+        assert_eq!(priority_fee_lamports(100_000, 0), 0);
+        assert_eq!(priority_fee_lamports(u64::MAX, u32::MAX), u64::MAX);
     }
 
     #[tokio::test]

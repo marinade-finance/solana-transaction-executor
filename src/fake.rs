@@ -10,7 +10,7 @@ use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status_client_types::TransactionStatus;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use crate::{
@@ -23,6 +23,7 @@ pub(crate) struct Fake {
     simulation: Option<serde_json::Value>,
     fees: Result<Vec<u64>, String>,
     pub fee_calls: AtomicUsize,
+    pub simulated: Mutex<Vec<VersionedTransaction>>,
 }
 
 impl Fake {
@@ -31,6 +32,7 @@ impl Fake {
             simulation: Some(simulation),
             fees: Ok(vec![]),
             fee_calls: AtomicUsize::new(0),
+            simulated: Mutex::new(vec![]),
         })
     }
 
@@ -39,6 +41,7 @@ impl Fake {
             simulation: None,
             fees,
             fee_calls: AtomicUsize::new(0),
+            simulated: Mutex::new(vec![]),
         })
     }
 
@@ -64,8 +67,9 @@ impl SimulateTransactionProvider for Fake {
 
     async fn simulate_unsigned_transaction(
         &self,
-        _transaction: &VersionedTransaction,
+        transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult> {
+        self.simulated.lock().unwrap().push(transaction.clone());
         let simulation = self.simulation.clone().expect("the fake has no simulation");
         Ok(Response {
             context: RpcResponseContext {

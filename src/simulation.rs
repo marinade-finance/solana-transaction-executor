@@ -1,7 +1,11 @@
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::{versioned::VersionedTransaction, VersionedMessage};
 use solana_transaction_error::TransactionError;
 
 use crate::TransactionExecutor;
+
+// The protocol maxima, as in solana-program-runtime's execution_budget.
+pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+pub const MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES: u32 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Simulation {
@@ -16,11 +20,11 @@ impl TransactionExecutor {
         self.signature_statuses_provider.latest_blockhash().await
     }
 
-    /// Simulates without signatures, against the cluster's latest blockhash.
+    /// Simulates without signatures, against the latest blockhash; an unset v1 limit runs at the max.
     pub async fn simulate(&self, transaction: &VersionedTransaction) -> anyhow::Result<Simulation> {
         let result = self
             .simulate_transaction_provider
-            .simulate_unsigned_transaction(transaction)
+            .simulate_unsigned_transaction(&with_unset_limits_at_max(transaction))
             .await?
             .value;
         Ok(Simulation {
@@ -30,6 +34,21 @@ impl TransactionExecutor {
             logs: result.logs.unwrap_or_default(),
         })
     }
+}
+
+// A v1 limit left unset is 0, which would fail the simulation before it measures anything.
+fn with_unset_limits_at_max(transaction: &VersionedTransaction) -> VersionedTransaction {
+    let mut transaction = transaction.clone();
+    if let VersionedMessage::V1(message) = &mut transaction.message {
+        let config = &mut message.config;
+        config
+            .compute_unit_limit
+            .get_or_insert(MAX_COMPUTE_UNIT_LIMIT);
+        config
+            .loaded_accounts_data_size_limit
+            .get_or_insert(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES);
+    }
+    transaction
 }
 
 #[cfg(test)]
@@ -48,18 +67,55 @@ mod tests {
     }
 
     fn transaction() -> VersionedTransaction {
+        transaction_with(v1::TransactionConfig::empty())
+    }
+
+    fn transaction_with(config: v1::TransactionConfig) -> VersionedTransaction {
         let payer = Keypair::new();
-        let message = v1::Message::try_compile_with_config(
-            &payer.pubkey(),
-            &[],
-            Hash::default(),
-            v1::TransactionConfig::empty(),
-        )
-        .unwrap();
+        let message =
+            v1::Message::try_compile_with_config(&payer.pubkey(), &[], Hash::default(), config)
+                .unwrap();
         VersionedTransaction {
             signatures: vec![Signature::default()],
             message: VersionedMessage::V1(message),
         }
+    }
+
+    async fn simulated_config(transaction: VersionedTransaction) -> v1::TransactionConfig {
+        let fake = Fake::simulating(serde_json::json!({ "err": null }));
+        fake.clone()
+            .executor()
+            .simulate(&transaction)
+            .await
+            .unwrap();
+        let simulated = fake.simulated.lock().unwrap().pop().unwrap();
+        match simulated.message {
+            VersionedMessage::V1(message) => message.config,
+            other => panic!("simulated a non-v1 message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unset_v1_limit_is_simulated_at_the_protocol_maximum() {
+        let config = simulated_config(transaction()).await;
+
+        assert_eq!(config.compute_unit_limit, Some(MAX_COMPUTE_UNIT_LIMIT));
+        assert_eq!(
+            config.loaded_accounts_data_size_limit,
+            Some(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES)
+        );
+        assert_eq!(config.priority_fee, None);
+        assert_eq!(config.heap_size, None);
+    }
+
+    #[tokio::test]
+    async fn a_set_v1_limit_is_simulated_as_set() {
+        let set = v1::TransactionConfig::empty()
+            .with_compute_unit_limit(50_000)
+            .with_loaded_accounts_data_size_limit(1_024)
+            .with_priority_fee(7);
+
+        assert_eq!(simulated_config(transaction_with(set)).await, set);
     }
 
     #[tokio::test]

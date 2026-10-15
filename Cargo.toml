@@ -13,14 +13,14 @@ futures-util = "0.3"
 log = "0.4"
 reqwest = { version = "^0.12", features = ["json", "blocking"] }
 serde_json = "1.0.149"
-solana-client = "~4.3.1"
+solana-client = "~4.3.0"
 solana-commitment-config = "3.1"
 solana-hash = "4.4"
 solana-pubkey = "4.2"
 solana-signature = "3.4"
 solana-transaction = { version = "~4.3.0", features = ["wincode"] }
 solana-transaction-error = "3.3"
-solana-transaction-status-client-types = { version = "~4.3.1", features = ["agave-unstable-api"] }
+solana-transaction-status-client-types = { version = "~4.3.0", features = ["agave-unstable-api"] }
 tokio = { version = "1", features = ["full"] }
 wincode = "0.6.1"
 

@@ -38,6 +38,7 @@ pub struct Attempt {
     pub signature: Signature,
     pub blockhash: Hash,
     pub last_valid_block_height: u64,
+    /// Sent by this execution, or yielded as `sent_before`.
     pub sent: bool,
     pub send_error: Option<String>,
     pub refused: Option<TransactionError>,

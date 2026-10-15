@@ -236,7 +236,19 @@ fn attempt(n: u8) -> AttemptTransaction {
             message: VersionedMessage::V1(message),
         },
         last_valid_block_height: LAST_VALID,
+        sent_before: false,
     }
+}
+
+fn sent_before(n: u8) -> AttemptTransaction {
+    AttemptTransaction {
+        sent_before: true,
+        ..attempt(n)
+    }
+}
+
+async fn resume(script: Script) -> (Execution, Arc<Scripted>) {
+    execute_stream(script, config(), vec![Ok(sent_before(1)), Ok(attempt(2))]).await
 }
 
 async fn execute(script: Script, config: TransactionExecutorConfig) -> (Execution, Arc<Scripted>) {
@@ -604,6 +616,101 @@ async fn a_simulation_error_after_an_expired_send_is_not_sent() {
     assert!(execution.attempts[0].sent);
     assert!(!execution.attempts[1].sent);
     assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_sent_before_attempt_past_its_blockhash_is_found_in_the_ledger_not_rebuilt() {
+    let (execution, chain) = resume(Script {
+        refusals: VecDeque::from([Some(TransactionError::BlockhashNotFound)]),
+        history: HashMap::from([(Signature::from([1; 64]), finalized(6, Ok(())))]),
+        ..Script::default()
+    })
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 6,
+        }
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert!(execution.attempts[0].sent);
+    assert!(chain.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_sent_before_attempt_proven_expired_is_followed_by_a_fresh_one() {
+    let (execution, chain) = resume(Script {
+        refusals: VecDeque::from([Some(TransactionError::BlockhashNotFound)]),
+        landings: VecDeque::from([Some(Ok(()))]),
+        ..Script::default()
+    })
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([2; 64]),
+            slot: 10,
+        }
+    );
+    assert_eq!(*chain.sent.lock().unwrap(), vec![Signature::from([2; 64])]);
+    assert_eq!(chain.sends_at_block_height_reads.lock().unwrap()[0], 0);
+}
+
+#[tokio::test]
+async fn a_sent_before_attempt_with_a_valid_blockhash_is_held_not_rebuilt() {
+    let (execution, chain) = resume(Script {
+        refusals: VecDeque::from([Some(TransactionError::BlockhashNotFound)]),
+        block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
+        ..Script::default()
+    })
+    .await;
+
+    assert!(
+        matches!(&execution.outcome, Outcome::Unknown { reason } if reason.contains("still valid")),
+        "{execution:?}"
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert!(chain.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_sent_before_attempt_that_simulates_is_resent_as_is() {
+    let (execution, chain) = resume(Script {
+        landings: VecDeque::from([Some(Ok(()))]),
+        ..Script::default()
+    })
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 10,
+        }
+    );
+    assert_eq!(*chain.sent.lock().unwrap(), vec![Signature::from([1; 64])]);
+}
+
+#[tokio::test]
+async fn a_refused_sent_before_attempt_that_landed_earlier_is_landed() {
+    let (execution, chain) = resume(Script {
+        refusals: VecDeque::from([Some(custom(1))]),
+        history: HashMap::from([(Signature::from([1; 64]), finalized(6, Ok(())))]),
+        ..Script::default()
+    })
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 6,
+        }
+    );
+    assert!(chain.sent.lock().unwrap().is_empty());
 }
 
 #[test]
