@@ -96,6 +96,10 @@ impl SignatureStatusesProvider for Fake {
     async fn is_blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
         unreachable!("no test reads a blockhash through the fake")
     }
+
+    async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
+        unreachable!("no test reads a blockhash through the fake")
+    }
 }
 
 #[async_trait]

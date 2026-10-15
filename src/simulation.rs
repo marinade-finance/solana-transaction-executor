@@ -12,6 +12,10 @@ pub struct Simulation {
 }
 
 impl TransactionExecutor {
+    pub async fn latest_blockhash(&self) -> anyhow::Result<solana_hash::Hash> {
+        self.signature_statuses_provider.latest_blockhash().await
+    }
+
     /// Simulates without signatures, against the cluster's latest blockhash.
     pub async fn simulate(&self, transaction: &VersionedTransaction) -> anyhow::Result<Simulation> {
         let result = self

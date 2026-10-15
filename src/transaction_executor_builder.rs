@@ -127,6 +127,7 @@ pub trait SignatureStatusesProvider {
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>>;
     async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool>;
+    async fn latest_blockhash(&self) -> anyhow::Result<Hash>;
 }
 
 #[async_trait]
@@ -195,6 +196,10 @@ impl SignatureStatusesProvider for DefaultProvider {
             .rpc_client
             .is_blockhash_valid(blockhash, self.rpc_client.commitment())
             .await?)
+    }
+
+    async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
+        Ok(self.rpc_client.get_latest_blockhash().await?)
     }
 }
 
