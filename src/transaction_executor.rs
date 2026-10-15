@@ -1,12 +1,12 @@
 use futures_core::stream::Stream;
 use futures_util::stream::StreamExt;
 use solana_client::rpc_client::SerializableTransaction;
-use solana_hash::Hash;
+use solana_commitment_config::CommitmentConfig;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::TransactionStatus;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     sync::RwLock,
@@ -14,13 +14,18 @@ use tokio::{
 };
 
 use crate::{
-    Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider, SendTransactionMeta,
-    SendTransactionProvider, SignatureStatusesProvider, SimulateTransactionProvider,
-    TransactionExecutorConfig,
+    redact::redact_urls, Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider,
+    SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
+    SimulateTransactionProvider, TransactionExecutorConfig,
 };
 
 pub type TransactionBuilderResult =
     Pin<Box<dyn Future<Output = anyhow::Result<VersionedTransaction>> + Send>>;
+
+pub struct AttemptTransaction {
+    pub transaction: VersionedTransaction,
+    pub last_valid_block_height: u64,
+}
 
 pub struct RetryPolicy {}
 
@@ -50,7 +55,7 @@ impl From<Landing> for Outcome {
 
 enum Waited {
     Landed(Landing),
-    NextAttempt,
+    Expired,
     Unknown(String),
 }
 
@@ -135,7 +140,7 @@ impl TransactionExecutor {
     /// Ends only on a landing or with proof of none, unless the bound passes or the RPC fails.
     pub async fn execute_transaction(
         &self,
-        transaction_builder: impl Stream<Item = anyhow::Result<VersionedTransaction>>,
+        transaction_builder: impl Stream<Item = anyhow::Result<AttemptTransaction>>,
     ) -> Execution {
         tokio::pin!(transaction_builder);
         let signatures = Arc::new(RwLock::new(Vec::<Signature>::new()));
@@ -146,6 +151,7 @@ impl TransactionExecutor {
 
         let mut attempts = Vec::<Attempt>::new();
         let mut stopped: Option<NotLanded> = None;
+        let mut last_sent_at = Instant::now();
         while let Some(transaction_build_result) = transaction_builder.next().await {
             let attempt = u32::try_from(attempts.len()).unwrap_or(u32::MAX) + 1;
             if attempt > self.transaction_executor_config.max_attempts {
@@ -153,11 +159,14 @@ impl TransactionExecutor {
                 break;
             }
 
-            let transaction = match transaction_build_result {
-                Ok(transaction) => transaction,
+            let AttemptTransaction {
+                transaction,
+                last_valid_block_height,
+            } = match transaction_build_result {
+                Ok(built) => built,
                 Err(err) => {
                     stopped = Some(NotLanded::NotSent {
-                        error: format!("Failed to build attempt #{attempt}: {err}"),
+                        error: redact_urls(&format!("Failed to build attempt #{attempt}: {err}")),
                     });
                     break;
                 }
@@ -168,6 +177,7 @@ impl TransactionExecutor {
             let mut record = Attempt {
                 signature,
                 blockhash,
+                last_valid_block_height,
                 sent: false,
                 send_error: None,
                 refused: None,
@@ -182,7 +192,7 @@ impl TransactionExecutor {
                 Err(err) => {
                     attempts.push(record);
                     stopped = Some(NotLanded::NotSent {
-                        error: format!("Failed to simulate {signature}: {err}"),
+                        error: redact_urls(&format!("Failed to simulate {signature}: {err}")),
                     });
                     break;
                 }
@@ -195,6 +205,7 @@ impl TransactionExecutor {
                         record.sent = true;
                         attempts.push(record);
                         signatures.write().await.push(signature);
+                        last_sent_at = Instant::now();
                         break;
                     }
                     TransactionError::BlockhashNotFound => {
@@ -226,15 +237,26 @@ impl TransactionExecutor {
                 .await
             {
                 log::error!("RPC error while sending the transaction {signature}: {err}");
-                record.send_error = Some(err.to_string());
+                record.send_error = Some(redact_urls(&err.to_string()));
             }
             record.sent = true;
             attempts.push(record);
             signatures.write().await.push(signature);
+            last_sent_at = Instant::now();
 
             // Hold retry until previous attempt's blockhash is invalid, see "Orphaned Revoke Tokens"
+            let sent = signatures.read().await.clone();
+            let last = &attempts[attempts.len() - 1];
             match self
-                .wait_for_attempt_outcome(&blockhash, &signature, &mut receiver_transaction_landed)
+                .wait_for_outcome(
+                    &sent,
+                    last,
+                    last_sent_at,
+                    self.transaction_executor_config
+                        .wait_for_blockhash_expiry_before_retry,
+                    self.transaction_executor_config.transaction_send_interval,
+                    &mut receiver_transaction_landed,
+                )
                 .await
             {
                 Waited::Landed(landing) => {
@@ -243,7 +265,7 @@ impl TransactionExecutor {
                         attempts,
                     }
                 }
-                Waited::NextAttempt => {}
+                Waited::Expired => {}
                 Waited::Unknown(reason) => {
                     return Execution {
                         outcome: Outcome::Unknown { reason },
@@ -253,8 +275,15 @@ impl TransactionExecutor {
             }
         }
 
+        let sent = signatures.read().await.clone();
         let outcome = self
-            .settle(&attempts, stopped, &mut receiver_transaction_landed)
+            .settle(
+                &attempts,
+                &sent,
+                stopped,
+                last_sent_at,
+                &mut receiver_transaction_landed,
+            )
             .await;
         Execution { outcome, attempts }
     }
@@ -262,15 +291,12 @@ impl TransactionExecutor {
     async fn settle(
         &self,
         attempts: &[Attempt],
+        sent: &[Signature],
         stopped: Option<NotLanded>,
+        last_sent_at: Instant,
         receiver_transaction_landed: &mut UnboundedReceiver<Landing>,
     ) -> Outcome {
         let not_landed = stopped.unwrap_or(NotLanded::Expired);
-        let sent: Vec<Signature> = attempts
-            .iter()
-            .filter(|attempt| attempt.sent)
-            .map(|attempt| attempt.signature)
-            .collect();
         let Some(last) = attempts.iter().rev().find(|attempt| attempt.sent) else {
             return Outcome::NotLanded(match not_landed {
                 NotLanded::Expired => NotLanded::NotSent {
@@ -280,137 +306,126 @@ impl TransactionExecutor {
             });
         };
 
+        match self
+            .wait_for_outcome(
+                sent,
+                last,
+                last_sent_at,
+                true,
+                self.transaction_executor_config
+                    .signature_status_check_interval,
+                receiver_transaction_landed,
+            )
+            .await
+        {
+            Waited::Landed(landing) => landing.into(),
+            Waited::Expired => Outcome::NotLanded(not_landed),
+            Waited::Unknown(reason) => Outcome::Unknown { reason },
+        }
+    }
+
+    /// Ends on a landing, or once `last` expired and the ledger knows none of `sent`.
+    async fn wait_for_outcome(
+        &self,
+        sent: &[Signature],
+        last: &Attempt,
+        sent_at: Instant,
+        hold_until_expiry: bool,
+        interval: Duration,
+        receiver_transaction_landed: &mut UnboundedReceiver<Landing>,
+    ) -> Waited {
         let config = &self.transaction_executor_config;
         let bound = config.waiting_time_after_last_send;
-        let deadline = Instant::now() + bound;
-        let mut blockhash_check_failures: u32 = 0;
+        let mut block_height_failures: u32 = 0;
         loop {
             tokio::select! {
-                landing = receiver_transaction_landed.recv() => {
-                    if let Some(landing) = landing {
-                        return landing.into();
-                    }
-                }
-                _ = sleep(config.signature_status_check_interval) => {}
+                landing = receiver_transaction_landed.recv() => match landing {
+                    Some(landing) => return Waited::Landed(landing),
+                    None => return Waited::Unknown("The status watcher stopped".into()),
+                },
+                _ = sleep(interval) => {}
             }
-            if Instant::now() >= deadline {
-                return Outcome::Unknown {
-                    reason: format!(
-                        "The blockhash of {} is still valid {bound:?} after the last send",
-                        last.signature
-                    ),
-                };
-            }
-            match self
-                .signature_statuses_provider
-                .is_blockhash_valid(&last.blockhash)
-                .await
-            {
-                Ok(true) => blockhash_check_failures = 0,
-                Ok(false) => break,
-                Err(err) => {
-                    blockhash_check_failures += 1;
-                    if blockhash_check_failures >= config.max_consecutive_blockhash_check_failures {
-                        return Outcome::Unknown {
-                            reason: format!(
-                                "is_blockhash_valid failed {blockhash_check_failures} consecutive times for {}: {err}",
+            if hold_until_expiry {
+                match self.signature_statuses_provider.block_height().await {
+                    Ok(height) if height <= last.last_valid_block_height => {
+                        block_height_failures = 0;
+                        if sent_at.elapsed() >= bound {
+                            return Waited::Unknown(format!(
+                                "The blockhash of {} is still valid {bound:?} after its send",
                                 last.signature
-                            ),
-                        };
+                            ));
+                        }
+                        log::info!(
+                            "Attempt {} not confirmed yet but its blockhash is still valid; holding to avoid a duplicate landing",
+                            last.signature
+                        );
+                        continue;
+                    }
+                    Ok(_) => log::info!("The blockhash of {} expired", last.signature),
+                    Err(err) => {
+                        block_height_failures += 1;
+                        let budget = config.max_consecutive_blockhash_check_failures;
+                        if block_height_failures >= budget {
+                            return Waited::Unknown(redact_urls(&format!(
+                                "The block height read failed {block_height_failures} consecutive times for {}: {err}",
+                                last.signature
+                            )));
+                        }
+                        log::warn!(
+                            "The block height read failed for {} ({block_height_failures}/{budget}): {err}; holding rather than rebuilding to be safe",
+                            last.signature
+                        );
+                        continue;
                     }
                 }
             }
-        }
 
-        let commitment = self.signature_statuses_provider.commitment();
-        loop {
             let statuses = match self
                 .signature_statuses_provider
-                .get_signature_statuses_with_history(&sent)
+                .get_signature_statuses_with_history(sent)
                 .await
             {
                 Ok(response) => response.value,
                 Err(err) => {
-                    return Outcome::Unknown {
-                        reason: format!("The history of the sent attempts cannot be read: {err}"),
-                    }
+                    return Waited::Unknown(redact_urls(&format!(
+                        "The history of the sent attempts cannot be read: {err}"
+                    )))
                 }
             };
-            let Some((status, signature)) = statuses
-                .into_iter()
-                .zip(sent.iter())
-                .find_map(|(status, signature)| status.map(|status| (status, *signature)))
-            else {
-                return Outcome::NotLanded(not_landed);
+            let commitment = self.signature_statuses_provider.commitment();
+            let Some((status, signature)) = best_status(statuses, sent, commitment) else {
+                return Waited::Expired;
             };
             if status.satisfies_commitment(commitment) {
-                return Landing {
+                return Waited::Landed(Landing {
                     signature,
                     slot: status.slot,
                     result: status.status,
-                }
-                .into();
+                });
             }
-            if Instant::now() >= deadline {
-                return Outcome::Unknown {
-                    reason: format!(
-                        "{signature} landed in the slot {} but has not reached {:?} within {bound:?}",
-                        status.slot, commitment.commitment
-                    ),
-                };
+            if sent_at.elapsed() >= bound {
+                return Waited::Unknown(format!(
+                    "{signature} landed in the slot {} but has not reached {:?} within {bound:?}",
+                    status.slot, commitment.commitment
+                ));
             }
-            sleep(config.signature_status_check_interval).await;
         }
     }
+}
 
-    async fn wait_for_attempt_outcome(
-        &self,
-        attempt_blockhash: &Hash,
-        attempt_signature: &Signature,
-        receiver_transaction_landed: &mut UnboundedReceiver<Landing>,
-    ) -> Waited {
-        let mut blockhash_check_failures: u32 = 0;
-        loop {
-            tokio::select! {
-                landing = receiver_transaction_landed.recv() => {
-                    if let Some(landing) = landing {
-                        return Waited::Landed(landing);
-                    } else {
-                        log::info!("No transaction has been verified");
-                        return Waited::NextAttempt;
-                    }
-                }
-                _ = sleep(self.transaction_executor_config.transaction_send_interval) => {
-                    if !self.transaction_executor_config.wait_for_blockhash_expiry_before_retry {
-                        log::info!("Attempt {attempt_signature} timeout (race-unsafe mode, blockhash check disabled)");
-                        return Waited::NextAttempt;
-                    }
-                    match self.signature_statuses_provider.is_blockhash_valid(attempt_blockhash).await {
-                        Ok(true) => {
-                            blockhash_check_failures = 0;
-                            log::info!(
-                                "Attempt {attempt_signature} not confirmed yet but blockhash still valid; holding before retry to avoid duplicate landing"
-                            );
-                        }
-                        Ok(false) => {
-                            log::info!("Attempt {attempt_signature} blockhash expired; safe to rebuild with a fresh blockhash");
-                            return Waited::NextAttempt;
-                        }
-                        Err(err) => {
-                            blockhash_check_failures += 1;
-                            let budget = self.transaction_executor_config.max_consecutive_blockhash_check_failures;
-                            if blockhash_check_failures >= budget {
-                                return Waited::Unknown(format!(
-                                    "is_blockhash_valid failed {blockhash_check_failures} consecutive times for {attempt_signature}: {err}"
-                                ));
-                            }
-                            log::warn!(
-                                "is_blockhash_valid check failed for {attempt_signature} ({blockhash_check_failures}/{budget}): {err}; holding rather than rebuilding to be safe"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
+/// A status at the commitment if any has one, else the first status found.
+pub(crate) fn best_status(
+    statuses: Vec<Option<TransactionStatus>>,
+    sent: &[Signature],
+    commitment: CommitmentConfig,
+) -> Option<(TransactionStatus, Signature)> {
+    let found: Vec<(TransactionStatus, Signature)> = statuses
+        .into_iter()
+        .zip(sent.iter().copied())
+        .filter_map(|(status, signature)| Some((status?, signature)))
+        .collect();
+    let at_commitment = found
+        .iter()
+        .position(|(status, _)| status.satisfies_commitment(commitment));
+    found.into_iter().nth(at_commitment.unwrap_or(0))
 }

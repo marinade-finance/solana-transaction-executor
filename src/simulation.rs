@@ -12,7 +12,7 @@ pub struct Simulation {
 }
 
 impl TransactionExecutor {
-    pub async fn latest_blockhash(&self) -> anyhow::Result<solana_hash::Hash> {
+    pub async fn latest_blockhash(&self) -> anyhow::Result<(solana_hash::Hash, u64)> {
         self.signature_statuses_provider.latest_blockhash().await
     }
 

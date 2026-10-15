@@ -132,8 +132,9 @@ pub trait SignatureStatusesProvider {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>>;
-    async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool>;
-    async fn latest_blockhash(&self) -> anyhow::Result<Hash>;
+    /// The blockhash and its last valid block height, at the commitment.
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)>;
+    async fn block_height(&self) -> anyhow::Result<u64>;
     fn commitment(&self) -> CommitmentConfig;
 }
 
@@ -198,15 +199,15 @@ impl SignatureStatusesProvider for DefaultProvider {
         Ok(result)
     }
 
-    async fn is_blockhash_valid(&self, blockhash: &Hash) -> anyhow::Result<bool> {
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
         Ok(self
             .rpc_client
-            .is_blockhash_valid(blockhash, self.rpc_client.commitment())
+            .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
             .await?)
     }
 
-    async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
-        Ok(self.rpc_client.get_latest_blockhash().await?)
+    async fn block_height(&self) -> anyhow::Result<u64> {
+        Ok(self.rpc_client.get_block_height().await?)
     }
 
     async fn get_signature_statuses_with_history(
@@ -242,6 +243,7 @@ impl SimulateTransactionProvider for DefaultProvider {
                 RpcSimulateTransactionConfig {
                     sig_verify: false,
                     replace_recent_blockhash: true,
+                    commitment: Some(self.rpc_client.commitment()),
                     ..Default::default()
                 },
             )
@@ -356,9 +358,50 @@ fn wire_base64(transaction: &VersionedTransaction) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_client::{
+        client_error,
+        rpc_client::RpcClientConfig,
+        rpc_request::RpcRequest,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
     use solana_keypair::Keypair;
     use solana_message::{v1, VersionedMessage};
     use solana_signer::Signer;
+    use std::sync::Mutex;
+
+    struct Recorder(Arc<Mutex<Vec<Value>>>);
+
+    #[async_trait]
+    impl RpcSender for Recorder {
+        async fn send(&self, _request: RpcRequest, params: Value) -> client_error::Result<Value> {
+            self.0.lock().unwrap().push(params);
+            Ok(json!({ "context": { "slot": 1 }, "value": { "err": null, "logs": [] } }))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "recorder".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_simulation_runs_at_the_client_commitment() {
+        let params = Arc::new(Mutex::new(vec![]));
+        let rpc_client = RpcClient::new_sender(
+            Recorder(params.clone()),
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        );
+
+        DefaultProvider::new(Arc::new(rpc_client))
+            .simulate_unsigned_transaction(&VersionedTransaction::default())
+            .await
+            .unwrap();
+
+        assert_eq!(params.lock().unwrap()[0][1]["commitment"], "confirmed");
+    }
 
     #[test]
     fn a_v1_transaction_is_sent_in_its_wire_format() {

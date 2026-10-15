@@ -6,8 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::stream;
-use solana_client::rpc_response::{
-    Response, RpcResponseContext, RpcResult, RpcSimulateTransactionResult,
+use solana_client::{
+    client_error::ClientErrorKind,
+    rpc_response::{Response, RpcResponseContext, RpcResult, RpcSimulateTransactionResult},
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
@@ -22,18 +23,21 @@ use solana_transaction_status_client_types::{
 };
 
 use crate::{
-    Execution, NotLanded, Outcome, PrioritizationFeesProvider, SendTransactionMeta,
-    SendTransactionProvider, SignatureStatusesProvider, SimulateTransactionProvider,
-    TransactionExecutor, TransactionExecutorConfig,
+    transaction_executor::best_status, AttemptTransaction, Execution, NotLanded, Outcome,
+    PrioritizationFeesProvider, SendTransactionMeta, SendTransactionProvider,
+    SignatureStatusesProvider, SimulateTransactionProvider, TransactionExecutor,
+    TransactionExecutorConfig,
 };
 
 /// What the chain answers per attempt, in order; an empty queue leaves the attempt unanswered.
 #[derive(Default)]
 struct Script {
     refusals: VecDeque<Option<TransactionError>>,
+    simulation_errors: VecDeque<Option<String>>,
     landings: VecDeque<Option<Result<(), TransactionError>>>,
-    blockhash_valid: VecDeque<Result<bool, String>>,
+    block_heights: VecDeque<Result<u64, String>>,
     history: HashMap<Signature, TransactionStatus>,
+    watcher_panics: bool,
 }
 
 #[derive(Default)]
@@ -41,6 +45,7 @@ struct Scripted {
     script: Mutex<Script>,
     sent: Mutex<Vec<Signature>>,
     landed: Mutex<HashMap<Signature, TransactionStatus>>,
+    sends_at_block_height_reads: Mutex<Vec<usize>>,
 }
 
 fn response<T>(value: T) -> RpcResult<T> {
@@ -83,7 +88,14 @@ impl SimulateTransactionProvider for Scripted {
         &self,
         _transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult> {
-        let refusal = self.script.lock().unwrap().refusals.pop_front().flatten();
+        let (refusal, error) = {
+            let mut script = self.script.lock().unwrap();
+            let error = script.simulation_errors.pop_front().flatten();
+            (script.refusals.pop_front().flatten(), error)
+        };
+        if let Some(error) = error {
+            return Err(ClientErrorKind::Custom(error).into());
+        }
         response(RpcSimulateTransactionResult {
             err: refusal.map(UiTransactionError::from),
             logs: Some(vec!["Program log: scripted".into()]),
@@ -140,6 +152,10 @@ impl SignatureStatusesProvider for Scripted {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        assert!(
+            !self.script.lock().unwrap().watcher_panics,
+            "scripted watcher failure"
+        );
         let landed = self.landed.lock().unwrap();
         response(
             signatures
@@ -168,13 +184,16 @@ impl SignatureStatusesProvider for Scripted {
         )
     }
 
-    async fn is_blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
-        let next = self.script.lock().unwrap().blockhash_valid.pop_front();
-        next.unwrap_or(Ok(false)).map_err(anyhow::Error::msg)
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
+        Ok((Hash::new_unique(), LAST_VALID))
     }
 
-    async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
-        Ok(Hash::new_unique())
+    async fn block_height(&self) -> anyhow::Result<u64> {
+        let sends = self.sent.lock().unwrap().len();
+        self.sends_at_block_height_reads.lock().unwrap().push(sends);
+        let next = self.script.lock().unwrap().block_heights.pop_front();
+        next.unwrap_or(Ok(LAST_VALID + 1))
+            .map_err(anyhow::Error::msg)
     }
 
     fn commitment(&self) -> CommitmentConfig {
@@ -200,7 +219,9 @@ fn config() -> TransactionExecutorConfig {
     }
 }
 
-fn attempt(n: u8) -> VersionedTransaction {
+const LAST_VALID: u64 = 100;
+
+fn attempt(n: u8) -> AttemptTransaction {
     let payer = Pubkey::new_unique();
     let message = v1::Message::try_compile_with_config(
         &payer,
@@ -209,9 +230,12 @@ fn attempt(n: u8) -> VersionedTransaction {
         v1::TransactionConfig::empty(),
     )
     .unwrap();
-    VersionedTransaction {
-        signatures: vec![Signature::from([n; 64])],
-        message: VersionedMessage::V1(message),
+    AttemptTransaction {
+        transaction: VersionedTransaction {
+            signatures: vec![Signature::from([n; 64])],
+            message: VersionedMessage::V1(message),
+        },
+        last_valid_block_height: LAST_VALID,
     }
 }
 
@@ -222,7 +246,7 @@ async fn execute(script: Script, config: TransactionExecutorConfig) -> (Executio
 async fn execute_stream(
     script: Script,
     config: TransactionExecutorConfig,
-    attempts: Vec<anyhow::Result<VersionedTransaction>>,
+    attempts: Vec<anyhow::Result<AttemptTransaction>>,
 ) -> (Execution, Arc<Scripted>) {
     let chain = Arc::new(Scripted {
         script: Mutex::new(script),
@@ -326,6 +350,25 @@ async fn an_attempt_that_cannot_be_built_is_not_sent() {
 }
 
 #[tokio::test]
+async fn an_rpc_error_in_the_execution_carries_no_api_key() {
+    let (execution, _) = execute_stream(
+        Script::default(),
+        config(),
+        vec![Err(anyhow::anyhow!(
+            "error sending request for url (https://rpc.example.com/?api-key=SECRET)"
+        ))],
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::NotLanded(NotLanded::NotSent {
+            error: "Failed to build attempt #1: error sending request for url (https://rpc.example.com/<redacted>)".into(),
+        })
+    );
+}
+
+#[tokio::test]
 async fn attempts_that_all_expire_unfound_did_not_land() {
     let (execution, chain) = execute(Script::default(), config()).await;
 
@@ -336,8 +379,8 @@ async fn attempts_that_all_expire_unfound_did_not_land() {
 }
 
 #[tokio::test]
-async fn a_landing_only_the_ledger_knows_is_found_at_the_end() {
-    let (execution, _) = execute(
+async fn a_landing_only_the_ledger_knows_is_found_before_the_next_attempt() {
+    let (execution, chain) = execute(
         Script {
             history: HashMap::from([(Signature::from([2; 64]), finalized(42, Ok(())))]),
             ..Script::default()
@@ -353,7 +396,8 @@ async fn a_landing_only_the_ledger_knows_is_found_at_the_end() {
             slot: 42,
         }
     );
-    assert_eq!(execution.attempts.len(), 3);
+    assert_eq!(execution.attempts.len(), 2);
+    assert_eq!(chain.sent.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -377,7 +421,7 @@ async fn a_landing_below_the_commitment_is_unknown_past_the_bound() {
 async fn a_blockhash_valid_past_the_bound_is_unknown() {
     let (execution, _) = execute(
         Script {
-            blockhash_valid: VecDeque::from(vec![Ok(true); 1_000]),
+            block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
             ..Script::default()
         },
         TransactionExecutorConfig {
@@ -399,7 +443,7 @@ async fn a_blockhash_valid_past_the_bound_is_unknown() {
 async fn a_blockhash_check_that_keeps_failing_is_unknown() {
     let (execution, chain) = execute(
         Script {
-            blockhash_valid: VecDeque::from(vec![Err("node down".to_string()); 2]),
+            block_heights: VecDeque::from(vec![Err("node down".to_string()); 2]),
             ..Script::default()
         },
         config(),
@@ -435,4 +479,156 @@ async fn an_already_processed_attempt_is_resolved_from_the_ledger() {
     assert_eq!(execution.attempts.len(), 1);
     assert!(execution.attempts[0].sent);
     assert!(chain.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_landing_the_watcher_missed_stops_the_next_attempt() {
+    let (execution, chain) = execute(
+        Script {
+            history: HashMap::from([(Signature::from([1; 64]), finalized(7, Ok(())))]),
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 7,
+        }
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_attempt_held_at_its_last_valid_height_is_unknown_past_the_bound() {
+    let (execution, chain) = execute(
+        Script {
+            block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert!(
+        matches!(&execution.outcome, Outcome::Unknown { reason } if reason.contains("still valid")),
+        "{execution:?}"
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_waits_until_the_block_height_passes_the_last_valid_one() {
+    let (execution, chain) = execute(
+        Script {
+            block_heights: VecDeque::from([Ok(LAST_VALID - 1), Ok(LAST_VALID)]),
+            ..Script::default()
+        },
+        TransactionExecutorConfig {
+            max_attempts: 2,
+            ..config()
+        },
+    )
+    .await;
+
+    assert_eq!(execution.outcome, Outcome::NotLanded(NotLanded::Expired));
+    assert_eq!(
+        *chain.sends_at_block_height_reads.lock().unwrap(),
+        vec![1, 1, 1, 2, 2]
+    );
+    assert_eq!(chain.sent.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_stopped_status_watcher_is_unknown() {
+    let (execution, chain) = execute(
+        Script {
+            block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
+            watcher_panics: true,
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Unknown {
+            reason: "The status watcher stopped".into(),
+        }
+    );
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_attempt_whose_blockhash_is_not_found_is_skipped_unsent() {
+    let (execution, chain) = execute(
+        Script {
+            refusals: VecDeque::from([Some(TransactionError::BlockhashNotFound)]),
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert_eq!(execution.outcome, Outcome::NotLanded(NotLanded::Expired));
+    assert_eq!(execution.attempts.len(), 3);
+    assert!(!execution.attempts[0].sent);
+    assert_eq!(
+        *chain.sent.lock().unwrap(),
+        vec![Signature::from([2; 64]), Signature::from([3; 64])]
+    );
+}
+
+#[tokio::test]
+async fn a_simulation_error_after_an_expired_send_is_not_sent() {
+    let (execution, chain) = execute(
+        Script {
+            simulation_errors: VecDeque::from([None, Some("node down".to_string())]),
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert!(
+        matches!(&execution.outcome, Outcome::NotLanded(NotLanded::NotSent { error }) if error.contains("node down")),
+        "{execution:?}"
+    );
+    assert_eq!(execution.attempts.len(), 2);
+    assert!(execution.attempts[0].sent);
+    assert!(!execution.attempts[1].sent);
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_status_at_the_commitment_wins_over_an_earlier_one_below_it() {
+    let sent = [Signature::from([1; 64]), Signature::from([2; 64])];
+    let finalized_later = finalized(9, Ok(()));
+
+    assert_eq!(
+        best_status(
+            vec![Some(confirmed(8)), Some(finalized_later.clone())],
+            &sent,
+            CommitmentConfig::finalized()
+        ),
+        Some((finalized_later, sent[1]))
+    );
+    assert_eq!(
+        best_status(
+            vec![None, Some(confirmed(8))],
+            &sent,
+            CommitmentConfig::finalized()
+        ),
+        Some((confirmed(8), sent[1]))
+    );
+    assert_eq!(
+        best_status(vec![None, None], &sent, CommitmentConfig::finalized()),
+        None
+    );
 }

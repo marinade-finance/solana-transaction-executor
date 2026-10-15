@@ -5,6 +5,7 @@ mod execution_test;
 mod fake;
 mod fee_policy;
 mod outcome;
+mod redact;
 mod simulation;
 mod tip_policy;
 mod transaction_executor;

@@ -94,12 +94,12 @@ impl SignatureStatusesProvider for Fake {
         unreachable!("no test reads a status through the fake")
     }
 
-    async fn is_blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
         unreachable!("no test reads a blockhash through the fake")
     }
 
-    async fn latest_blockhash(&self) -> anyhow::Result<Hash> {
-        unreachable!("no test reads a blockhash through the fake")
+    async fn block_height(&self) -> anyhow::Result<u64> {
+        unreachable!("no test reads a block height through the fake")
     }
 
     async fn get_signature_statuses_with_history(

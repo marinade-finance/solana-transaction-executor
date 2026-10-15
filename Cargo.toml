@@ -15,12 +15,9 @@ reqwest = { version = "^0.12", features = ["json", "blocking"] }
 serde_json = "1.0.149"
 solana-client = "~4.3.1"
 solana-commitment-config = "3.1"
-solana-compute-budget-interface = "3"
 solana-hash = "4.4"
-solana-instruction = "3.4"
 solana-pubkey = "4.2"
 solana-signature = "3.4"
-solana-signer = "3"
 solana-transaction = { version = "~4.3.0", features = ["wincode"] }
 solana-transaction-error = "3.3"
 solana-transaction-status-client-types = { version = "~4.3.1", features = ["agave-unstable-api"] }
@@ -31,3 +28,4 @@ wincode = "0.6.1"
 solana-instruction = "3.4"
 solana-keypair = "3.1"
 solana-message = "~4.6.0"
+solana-signer = "3"
