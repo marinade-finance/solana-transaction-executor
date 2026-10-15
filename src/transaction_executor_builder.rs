@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_client::SerializableTransaction,
-    rpc_config::RpcSendTransactionConfig,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
     rpc_response::{RpcResult, RpcSimulateTransactionResult},
 };
 use solana_hash::Hash;
@@ -120,6 +120,10 @@ pub trait SimulateTransactionProvider {
         &self,
         transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult>;
+    async fn simulate_unsigned_transaction(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> RpcResult<RpcSimulateTransactionResult>;
 }
 
 pub struct SendTransactionMeta {
@@ -181,6 +185,22 @@ impl SimulateTransactionProvider for DefaultProvider {
         transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult> {
         self.rpc_client.simulate_transaction(transaction).await
+    }
+
+    async fn simulate_unsigned_transaction(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> RpcResult<RpcSimulateTransactionResult> {
+        self.rpc_client
+            .simulate_transaction_with_config(
+                transaction,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            )
+            .await
     }
 }
 
