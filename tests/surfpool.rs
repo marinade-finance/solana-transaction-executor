@@ -1,5 +1,7 @@
 use std::{
+    fs::{self, File},
     net::TcpListener,
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Arc,
     time::Duration,
@@ -24,6 +26,7 @@ use solana_transaction_executor::{
 
 const VERSION: &str = "surfpool 1.6.1";
 const SLOT_MS: u64 = 50;
+const LAUNCH_TRIES: usize = 3;
 const TRANSFER_LAMPORTS: u64 = 1_000_000;
 const COMPUTE_UNIT_LIMIT: u32 = 10_000;
 const LOADED_BYTES_LIMIT: u32 = 128 * 1024;
@@ -64,8 +67,21 @@ async fn start() -> Surfpool {
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), VERSION);
 
     let payer = Keypair::new();
+    let mut failures = Vec::new();
+    for _ in 0..LAUNCH_TRIES {
+        match launch(&payer).await {
+            Ok((child, rpc)) => return Surfpool { child, rpc, payer },
+            Err(failure) => failures.push(failure),
+        }
+    }
+    panic!("Surfpool did not start: {failures:#?}");
+}
+
+// The probed ports are free only until Surfpool binds them, so a parallel test can take them first.
+async fn launch(payer: &Keypair) -> Result<(Child, Arc<RpcClient>), String> {
     let port = free_port_pair();
-    let child = Command::new(binary())
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("surfpool-{port}.log"));
+    let mut child = Command::new(binary())
         .args(["start", "--offline", "--no-deploy", "--yes", "--ci"])
         .args(["--db", ":memory:", "--host", "127.0.0.1"])
         .args([
@@ -78,27 +94,29 @@ async fn start() -> Surfpool {
         .args(["--airdrop", &payer.pubkey().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(File::create(&log).unwrap())
         .spawn()
         .unwrap();
     let rpc = Arc::new(RpcClient::new_with_commitment(
         format!("http://127.0.0.1:{port}"),
         CommitmentConfig::confirmed(),
     ));
-    let surfpool = Surfpool { child, rpc, payer };
     for _ in 0..200 {
-        if surfpool
-            .rpc
-            .get_balance(&surfpool.payer.pubkey())
-            .await
-            .unwrap_or(0)
-            > 0
-        {
-            return surfpool;
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = fs::read_to_string(&log).unwrap_or_default();
+            return Err(format!("port {port}: {status}: {}", stderr.trim()));
+        }
+        if rpc.get_balance(&payer.pubkey()).await.unwrap_or(0) > 0 {
+            return Ok((child, rpc));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("Surfpool on port {port} did not start with the payer funded");
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "port {port}: the payer was not funded in 10 s, log {}",
+        log.display()
+    ))
 }
 
 fn executor(surfpool: &Surfpool) -> TransactionExecutor {

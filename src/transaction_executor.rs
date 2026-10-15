@@ -105,7 +105,10 @@ impl TransactionExecutor {
                 {
                     Ok(result) => result.value,
                     Err(err) => {
-                        log::error!("Failed to get transaction signatures statuses: {err}");
+                        log::error!(
+                            "Failed to get transaction signatures statuses: {}",
+                            redact_urls(&err.to_string())
+                        );
                         continue;
                     }
                 };
@@ -246,8 +249,9 @@ impl TransactionExecutor {
                     .send_transaction(&transaction, SendTransactionMeta { attempt })
                     .await
                 {
-                    log::error!("RPC error while sending the transaction {signature}: {err}");
-                    record.send_error = Some(redact_urls(&err.to_string()));
+                    let error = redact_urls(&err.to_string());
+                    log::error!("RPC error while sending the transaction {signature}: {error}");
+                    record.send_error = Some(error);
                 }
                 record.sent = true;
                 if !sent_before {
@@ -385,8 +389,9 @@ impl TransactionExecutor {
                             )));
                         }
                         log::warn!(
-                            "The block height read failed for {} ({block_height_failures}/{budget}): {err}; holding rather than rebuilding to be safe",
-                            last.signature
+                            "The block height read failed for {} ({block_height_failures}/{budget}): {}; holding rather than rebuilding to be safe",
+                            last.signature,
+                            redact_urls(&err.to_string())
                         );
                         continue;
                     }

@@ -1,7 +1,7 @@
 use log::warn;
 use solana_pubkey::Pubkey;
 
-use crate::TransactionExecutor;
+use crate::{redact::redact_urls, TransactionExecutor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriorityLevel {
@@ -96,7 +96,10 @@ impl TransactionExecutor {
             {
                 Ok(fees) => level.of(&fees),
                 Err(err) => {
-                    warn!("Recent prioritization fees unavailable, escalating without them: {err}");
+                    warn!(
+                        "Recent prioritization fees unavailable, escalating without them: {}",
+                        redact_urls(&err.to_string())
+                    );
                     None
                 }
             },
