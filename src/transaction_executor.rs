@@ -7,7 +7,7 @@ use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::TransactionStatus;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender};
 use tokio::{
     sync::RwLock,
     time::{sleep, Instant},
@@ -226,6 +226,7 @@ impl TransactionExecutor {
                 Some(TransactionError::BlockhashNotFound) => {
                     log::info!("Simulation of {signature} failed because blockhash was not found");
                     attempts.push(record);
+                    sleep(self.transaction_executor_config.transaction_send_interval).await;
                     continue;
                 }
                 Some(error) => {
@@ -412,7 +413,14 @@ impl TransactionExecutor {
             };
             let commitment = self.signature_statuses_provider.commitment();
             let Some((status, signature)) = best_status(statuses, sent, commitment) else {
-                return Waited::Expired;
+                // The watcher's node may know a landing the history's node does not.
+                return match receiver_transaction_landed.try_recv() {
+                    Ok(landing) => Waited::Landed(landing),
+                    Err(TryRecvError::Empty) => Waited::Expired,
+                    Err(TryRecvError::Disconnected) => {
+                        Waited::Unknown("The status watcher stopped".into())
+                    }
+                };
             };
             if status.satisfies_commitment(commitment) {
                 return Waited::Landed(Landing {

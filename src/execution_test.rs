@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -38,6 +38,8 @@ struct Script {
     block_heights: VecDeque<Result<u64, String>>,
     history: HashMap<Signature, TransactionStatus>,
     watcher_panics: bool,
+    /// The first attempt lands during the first block height read, seen by the watcher only.
+    watcher_only_landing: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +47,8 @@ struct Scripted {
     script: Mutex<Script>,
     sent: Mutex<Vec<Signature>>,
     landed: Mutex<HashMap<Signature, TransactionStatus>>,
+    landed_for_watcher: Mutex<HashMap<Signature, TransactionStatus>>,
+    simulated_at: Mutex<Vec<Instant>>,
     sends_at_block_height_reads: Mutex<Vec<usize>>,
 }
 
@@ -88,6 +92,7 @@ impl SimulateTransactionProvider for Scripted {
         &self,
         _transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult> {
+        self.simulated_at.lock().unwrap().push(Instant::now());
         let (refusal, error) = {
             let mut script = self.script.lock().unwrap();
             let error = script.simulation_errors.pop_front().flatten();
@@ -157,10 +162,16 @@ impl SignatureStatusesProvider for Scripted {
             "scripted watcher failure"
         );
         let landed = self.landed.lock().unwrap();
+        let landed_for_watcher = self.landed_for_watcher.lock().unwrap();
         response(
             signatures
                 .iter()
-                .map(|signature| landed.get(signature).cloned())
+                .map(|signature| {
+                    landed
+                        .get(signature)
+                        .or_else(|| landed_for_watcher.get(signature))
+                        .cloned()
+                })
                 .collect(),
         )
     }
@@ -191,7 +202,21 @@ impl SignatureStatusesProvider for Scripted {
     async fn block_height(&self) -> anyhow::Result<u64> {
         let sends = self.sent.lock().unwrap().len();
         self.sends_at_block_height_reads.lock().unwrap().push(sends);
-        let next = self.script.lock().unwrap().block_heights.pop_front();
+        let (next, watcher_only_landing) = {
+            let mut script = self.script.lock().unwrap();
+            (
+                script.block_heights.pop_front(),
+                std::mem::take(&mut script.watcher_only_landing),
+            )
+        };
+        if watcher_only_landing {
+            let first = self.sent.lock().unwrap()[0];
+            self.landed_for_watcher
+                .lock()
+                .unwrap()
+                .insert(first, finalized(10, Ok(())));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         next.unwrap_or(Ok(LAST_VALID + 1))
             .map_err(anyhow::Error::msg)
     }
@@ -516,6 +541,28 @@ async fn a_landing_the_watcher_missed_stops_the_next_attempt() {
 }
 
 #[tokio::test]
+async fn a_landing_the_history_misses_stops_the_next_attempt() {
+    let (execution, chain) = execute(
+        Script {
+            watcher_only_landing: true,
+            ..Script::default()
+        },
+        config(),
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 10,
+        }
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn an_attempt_held_at_its_last_valid_height_is_unknown_past_the_bound() {
     let (execution, chain) = execute(
         Script {
@@ -595,6 +642,8 @@ async fn an_attempt_whose_blockhash_is_not_found_is_skipped_unsent() {
         *chain.sent.lock().unwrap(),
         vec![Signature::from([2; 64]), Signature::from([3; 64])]
     );
+    let simulated_at = chain.simulated_at.lock().unwrap();
+    assert!(simulated_at[1] - simulated_at[0] >= config().transaction_send_interval);
 }
 
 #[tokio::test]

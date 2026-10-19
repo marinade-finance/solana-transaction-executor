@@ -13,22 +13,24 @@ pub enum PriorityLevel {
 }
 
 impl PriorityLevel {
+    // The percentiles of Helius getPriorityFeeEstimate's priority levels.
     fn basis_points(self) -> u64 {
         match self {
             PriorityLevel::Low => 2_500,
             PriorityLevel::Medium => 5_000,
             PriorityLevel::High => 7_500,
-            PriorityLevel::VeryHigh => 9_000,
+            PriorityLevel::VeryHigh => 9_500,
             PriorityLevel::UnsafeMax => 10_000,
         }
     }
 
+    /// A zero is a slot that needed no fee, so it counts.
     pub fn of(self, fees: &[u64]) -> Option<u64> {
-        let mut paid: Vec<u64> = fees.iter().copied().filter(|fee| *fee > 0).collect();
-        paid.sort_unstable();
-        let last = u64::try_from(paid.len().checked_sub(1)?).ok()?;
+        let mut fees = fees.to_vec();
+        fees.sort_unstable();
+        let last = u64::try_from(fees.len().checked_sub(1)?).ok()?;
         let index = (last * self.basis_points() + 5_000) / 10_000;
-        paid.get(usize::try_from(index).ok()?).copied()
+        fees.get(usize::try_from(index).ok()?).copied()
     }
 }
 
@@ -63,8 +65,11 @@ impl Default for FeePolicy {
 }
 
 impl FeePolicy {
-    pub fn first(&self) -> u64 {
-        self.start_micro_lamports_per_cu
+    pub fn first(&self, network: Option<u64>) -> u64 {
+        network
+            .unwrap_or(0)
+            .min(self.max_micro_lamports_per_cu)
+            .max(self.start_micro_lamports_per_cu)
     }
 
     pub fn next(&self, previous: u64, network: Option<u64>) -> u64 {
@@ -86,8 +91,16 @@ pub fn priority_fee_lamports(micro_lamports_per_cu: u64, compute_unit_limit: u32
 }
 
 impl TransactionExecutor {
+    pub async fn first_rate(&self, policy: &FeePolicy, writable: &[Pubkey]) -> u64 {
+        policy.first(self.network_rate(policy, writable).await)
+    }
+
     pub async fn next_rate(&self, policy: &FeePolicy, previous: u64, writable: &[Pubkey]) -> u64 {
-        let network = match policy.strategy {
+        policy.next(previous, self.network_rate(policy, writable).await)
+    }
+
+    async fn network_rate(&self, policy: &FeePolicy, writable: &[Pubkey]) -> Option<u64> {
+        match policy.strategy {
             FeeStrategy::Static => None,
             FeeStrategy::Dynamic { level } => match self
                 .prioritization_fees_provider
@@ -103,8 +116,7 @@ impl TransactionExecutor {
                     None
                 }
             },
-        };
-        policy.next(previous, network)
+        }
     }
 }
 
@@ -124,7 +136,7 @@ mod tests {
     #[test]
     fn the_default_pays_nothing_until_a_retry_and_then_doubles_to_the_cap() {
         let policy = FeePolicy::default();
-        let mut rates = vec![policy.first()];
+        let mut rates = vec![policy.first(None)];
         for _ in 0..9 {
             rates.push(policy.next(*rates.last().unwrap(), None));
         }
@@ -140,7 +152,7 @@ mod tests {
             start_micro_lamports_per_cu: 5_000,
             ..FeePolicy::default()
         };
-        assert_eq!(policy.first(), 5_000);
+        assert_eq!(policy.first(None), 5_000);
         assert_eq!(policy.next(5_000, None), 10_000);
     }
 
@@ -150,17 +162,27 @@ mod tests {
             start_micro_lamports_per_cu: 200_000,
             ..FeePolicy::default()
         };
-        assert_eq!(policy.next(policy.first(), None), 200_000);
+        assert_eq!(policy.first(Some(300_000)), 200_000);
+        assert_eq!(policy.next(policy.first(None), None), 200_000);
     }
 
     #[test]
-    fn a_level_picks_its_percentile_of_the_paid_fees() {
+    fn a_level_picks_its_percentile_of_the_fees() {
         let fees = [9_000, 0, 500, 3_000];
-        assert_eq!(PriorityLevel::Low.of(&fees), Some(3_000));
+        assert_eq!(PriorityLevel::Low.of(&fees), Some(500));
         assert_eq!(PriorityLevel::Medium.of(&fees), Some(3_000));
         assert_eq!(PriorityLevel::UnsafeMax.of(&fees), Some(9_000));
-        assert_eq!(PriorityLevel::Medium.of(&[0, 0]), None);
+        assert_eq!(PriorityLevel::Medium.of(&[0, 0]), Some(0));
         assert_eq!(PriorityLevel::Medium.of(&[]), None);
+    }
+
+    #[test]
+    fn a_few_paid_slots_among_free_ones_do_not_set_the_rate() {
+        let mut fees = vec![0; 147];
+        fees.extend([1_000, 50_000, 100_000]);
+        assert_eq!(PriorityLevel::Medium.of(&fees), Some(0));
+        assert_eq!(PriorityLevel::VeryHigh.of(&fees), Some(0));
+        assert_eq!(PriorityLevel::UnsafeMax.of(&fees), Some(100_000));
     }
 
     #[test]
@@ -185,6 +207,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dynamic_first_attempt_takes_the_network_rate_up_to_the_cap() {
+        let policy = dynamic(PriorityLevel::Medium);
+
+        let fake = Fake::with_fees(Ok(vec![0, 500, 3_000, 9_000]));
+        assert_eq!(
+            fake.clone().executor().first_rate(&policy, &[]).await,
+            3_000
+        );
+        assert_eq!(fake.fee_calls.load(Ordering::SeqCst), 1);
+
+        let busy = Fake::with_fees(Ok(vec![500_000])).executor();
+        assert_eq!(busy.first_rate(&policy, &[]).await, 100_000);
+
+        let failing = Fake::with_fees(Err("node down".to_string())).executor();
+        assert_eq!(failing.first_rate(&policy, &[]).await, 0);
+    }
+
+    #[tokio::test]
     async fn a_dynamic_retry_without_network_fees_escalates_statically() {
         let policy = dynamic(PriorityLevel::High);
 
@@ -200,6 +240,7 @@ mod tests {
         let fake = Fake::with_fees(Ok(vec![50_000]));
         let executor = fake.clone().executor();
 
+        assert_eq!(executor.first_rate(&FeePolicy::default(), &[]).await, 0);
         assert_eq!(
             executor.next_rate(&FeePolicy::default(), 0, &[]).await,
             1_000

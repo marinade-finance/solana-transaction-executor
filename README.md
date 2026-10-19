@@ -33,8 +33,9 @@ next attempt is pulled, so it is never replaced while it may still land. The
   transaction. A v1 limit left unset counts as 0, so it is simulated at `MAX_COMPUTE_UNIT_LIMIT`
   and `MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES`; the signed attempt must set its own.
 - **`FeePolicy`** — the first attempt pays the start rate, 0 by default. A retry doubles the rate
-  from a first step of 1,000 micro-lamports per CU up to 100,000. `FeeStrategy::Dynamic` also takes
-  the chosen percentile of the recent fees over the transaction's writable accounts. The rate is in
+  from a first step of 1,000 micro-lamports per CU up to 100,000. `FeeStrategy::Dynamic` raises every
+  attempt, the first too, to the chosen percentile of the recent fees over the transaction's writable
+  accounts. The rate is in
   micro-lamports per CU; `priority_fee_lamports` turns it into the total a v1 `priority_fee` takes.
 
 Tests against a local Surfpool 1.6.1 (offline, 50 ms slots) are ignored by default:
