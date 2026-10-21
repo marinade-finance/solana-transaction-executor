@@ -15,6 +15,9 @@ env:
   # Stripping symbols and optimizing for binary size
   RUSTFLAGS: -C strip=symbols -C opt-level=s
 
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-24.04
