@@ -1,14 +1,19 @@
 use async_trait::async_trait;
-use log::info;
+use base64::{prelude::BASE64_STANDARD, Engine};
+use log::{info, warn};
 use serde_json::{json, Value};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_client::SerializableTransaction,
-    rpc_config::RpcSendTransactionConfig,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
     rpc_response::{RpcResult, RpcSimulateTransactionResult},
 };
-use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
-use solana_transaction_status::TransactionStatus;
+use solana_commitment_config::CommitmentConfig;
+use solana_hash::Hash;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_status_client_types::TransactionStatus;
 use std::sync::Arc;
 
 use crate::{TipPolicy, TransactionExecutor, TransactionExecutorConfig};
@@ -19,6 +24,7 @@ pub struct TransactionExecutorBuilder {
     signature_statuses_provider: Option<Arc<dyn SignatureStatusesProvider + Send + Sync>>,
     simulate_transaction_provider: Option<Arc<dyn SimulateTransactionProvider + Send + Sync>>,
     send_transaction_provider: Option<Arc<dyn SendTransactionProvider + Send + Sync>>,
+    prioritization_fees_provider: Option<Arc<dyn PrioritizationFeesProvider + Send + Sync>>,
 }
 
 impl TransactionExecutorBuilder {
@@ -38,6 +44,7 @@ impl TransactionExecutorBuilder {
         self.with_signature_statuses_provider(DefaultProvider::new(rpc_client.clone()))
             .with_simulate_transaction_provider(DefaultProvider::new(rpc_client.clone()))
             .with_send_transaction_provider(DefaultProvider::new(rpc_client.clone()))
+            .with_prioritization_fees_provider(DefaultProvider::new(rpc_client.clone()))
     }
 
     pub fn with_signature_statuses_provider(
@@ -64,6 +71,14 @@ impl TransactionExecutorBuilder {
         self
     }
 
+    pub fn with_prioritization_fees_provider(
+        mut self,
+        provider: impl PrioritizationFeesProvider + Send + Sync + 'static,
+    ) -> Self {
+        self.prioritization_fees_provider = Some(Arc::new(provider));
+        self
+    }
+
     pub fn build(self) -> TransactionExecutor {
         let signature_statuses_provider = self
             .signature_statuses_provider
@@ -74,13 +89,35 @@ impl TransactionExecutorBuilder {
         let send_transaction_provider = self
             .send_transaction_provider
             .expect("Send transaction provider not set");
+        let prioritization_fees_provider = self
+            .prioritization_fees_provider
+            .expect("Prioritization fees provider not set");
 
         TransactionExecutor::new(
             self.transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
             send_transaction_provider,
+            prioritization_fees_provider,
         )
+    }
+
+    pub fn initialize(
+        rpc_client: Arc<RpcClient>,
+        sender_rpc_url: Option<String>,
+        tip_policy: Option<TipPolicy>,
+    ) -> Self {
+        if let Some(rpc_url) = sender_rpc_url {
+            TransactionExecutorBuilder::new()
+                .with_default_providers(rpc_client)
+                .with_send_transaction_provider(SendTransactionWithGrowingTipProvider {
+                    rpc_url,
+                    query_param: "tip".into(),
+                    tip_policy: tip_policy.unwrap_or_default(),
+                })
+        } else {
+            TransactionExecutorBuilder::new().with_default_providers(rpc_client.clone())
+        }
     }
 }
 
@@ -90,6 +127,15 @@ pub trait SignatureStatusesProvider {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>>;
+    /// Searches the ledger too, and keeps a status below the commitment.
+    async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>>;
+    /// The blockhash and its last valid block height, at the commitment.
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)>;
+    async fn block_height(&self) -> anyhow::Result<u64>;
+    fn commitment(&self) -> CommitmentConfig;
 }
 
 #[async_trait]
@@ -98,6 +144,15 @@ pub trait SimulateTransactionProvider {
         &self,
         transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult>;
+    async fn simulate_unsigned_transaction(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> RpcResult<RpcSimulateTransactionResult>;
+}
+
+#[async_trait]
+pub trait PrioritizationFeesProvider {
+    async fn recent_prioritization_fees(&self, writable: &[Pubkey]) -> anyhow::Result<Vec<u64>>;
 }
 
 pub struct SendTransactionMeta {
@@ -135,17 +190,37 @@ impl SignatureStatusesProvider for DefaultProvider {
             .value
             .into_iter()
             .map(|transaction_status| {
-                transaction_status.and_then(|transaction_status| {
-                    if transaction_status.satisfies_commitment(self.rpc_client.commitment()) {
-                        Some(transaction_status)
-                    } else {
-                        None
-                    }
+                transaction_status.filter(|transaction_status| {
+                    transaction_status.satisfies_commitment(self.rpc_client.commitment())
                 })
             })
             .collect();
 
         Ok(result)
+    }
+
+    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
+        Ok(self
+            .rpc_client
+            .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+            .await?)
+    }
+
+    async fn block_height(&self) -> anyhow::Result<u64> {
+        Ok(self.rpc_client.get_block_height().await?)
+    }
+
+    async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.rpc_client
+            .get_signature_statuses_with_history(signatures)
+            .await
+    }
+
+    fn commitment(&self) -> CommitmentConfig {
+        self.rpc_client.commitment()
     }
 }
 
@@ -156,6 +231,36 @@ impl SimulateTransactionProvider for DefaultProvider {
         transaction: &VersionedTransaction,
     ) -> RpcResult<RpcSimulateTransactionResult> {
         self.rpc_client.simulate_transaction(transaction).await
+    }
+
+    async fn simulate_unsigned_transaction(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> RpcResult<RpcSimulateTransactionResult> {
+        self.rpc_client
+            .simulate_transaction_with_config(
+                transaction,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    commitment: Some(self.rpc_client.commitment()),
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl PrioritizationFeesProvider for DefaultProvider {
+    async fn recent_prioritization_fees(&self, writable: &[Pubkey]) -> anyhow::Result<Vec<u64>> {
+        Ok(self
+            .rpc_client
+            .get_recent_prioritization_fees(writable)
+            .await?
+            .into_iter()
+            .map(|fee| fee.prioritization_fee)
+            .collect())
     }
 }
 
@@ -172,7 +277,7 @@ impl SendTransactionProvider for DefaultProvider {
                 transaction,
                 RpcSendTransactionConfig {
                     skip_preflight: true,
-                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+                    encoding: Some(solana_client::rpc_config::UiTransactionEncoding::Base64),
                     ..Default::default()
                 },
             )
@@ -184,16 +289,6 @@ pub struct SendTransactionWithGrowingTipProvider {
     pub rpc_url: String,
     pub tip_policy: TipPolicy,
     pub query_param: String,
-}
-
-impl Default for SendTransactionWithGrowingTipProvider {
-    fn default() -> Self {
-        Self {
-            rpc_url: Default::default(),
-            tip_policy: Default::default(),
-            query_param: "tip".into(),
-        }
-    }
 }
 
 #[async_trait]
@@ -213,7 +308,7 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
                 "id": 1,
                 "method": "sendTransaction",
                 "params": [
-                    base64::encode(bincode::serialize(transaction)?),
+                    wire_base64(transaction)?,
                     {
                         "encoding": "base64",
                         "skipPreflight": true,
@@ -238,12 +333,97 @@ impl SendTransactionProvider for SendTransactionWithGrowingTipProvider {
                 "Sender RPC response for {signature} is not a JSON: {err}, body: {body}"
             )
         })?;
-        if let Some(error) = rpc_response.get("error") {
+        if let Some(error) = rpc_response.get("error").filter(|error| !error.is_null()) {
             anyhow::bail!("Sender RPC refused {signature} sent with tip {tip}: {error}");
+        }
+        // Warn, not bail: the relay's success envelope is unverified and a hard reject would fail every send.
+        if rpc_response
+            .get("result")
+            .filter(|result| !result.is_null())
+            .is_none()
+        {
+            warn!("Sender RPC response for {signature} has neither result nor error");
         }
 
         info!("Transaction {signature} sent with tip {tip}, rpc response: {status} {body}");
 
         Ok(signature)
+    }
+}
+
+fn wire_base64(transaction: &VersionedTransaction) -> anyhow::Result<String> {
+    Ok(BASE64_STANDARD.encode(wincode::serialize(transaction)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_client::{
+        client_error,
+        rpc_client::RpcClientConfig,
+        rpc_request::RpcRequest,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
+    use solana_keypair::Keypair;
+    use solana_message::{v1, VersionedMessage};
+    use solana_signer::Signer;
+    use std::sync::Mutex;
+
+    struct Recorder(Arc<Mutex<Vec<Value>>>);
+
+    #[async_trait]
+    impl RpcSender for Recorder {
+        async fn send(&self, _request: RpcRequest, params: Value) -> client_error::Result<Value> {
+            self.0.lock().unwrap().push(params);
+            Ok(json!({ "context": { "slot": 1 }, "value": { "err": null, "logs": [] } }))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "recorder".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_simulation_runs_at_the_client_commitment() {
+        let params = Arc::new(Mutex::new(vec![]));
+        let rpc_client = RpcClient::new_sender(
+            Recorder(params.clone()),
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        );
+
+        DefaultProvider::new(Arc::new(rpc_client))
+            .simulate_unsigned_transaction(&VersionedTransaction::default())
+            .await
+            .unwrap();
+
+        assert_eq!(params.lock().unwrap()[0][1]["commitment"], "confirmed");
+    }
+
+    #[test]
+    fn a_v1_transaction_is_sent_in_its_wire_format() {
+        let payer = Keypair::new();
+        let message = v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &[],
+            Hash::new_unique(),
+            v1::TransactionConfig::empty(),
+        )
+        .unwrap();
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer]).unwrap();
+
+        let wire = BASE64_STANDARD
+            .decode(wire_base64(&transaction).unwrap())
+            .unwrap();
+
+        assert_eq!(wire[0], v1::V1_PREFIX);
+        assert_eq!(
+            wincode::deserialize::<VersionedTransaction>(&wire).unwrap(),
+            transaction
+        );
     }
 }
