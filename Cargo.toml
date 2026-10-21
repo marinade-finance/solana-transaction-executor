@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.92"
-base64 = "0.22.1"
+base64 = "0.23.1"
 futures-core = "0.3"
 futures-util = "0.3"
 log = "0.4"
