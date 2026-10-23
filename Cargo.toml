@@ -12,7 +12,7 @@ base64 = "0.23.1"
 futures-core = "0.3"
 futures-util = "0.3"
 log = "0.4"
-reqwest = { version = "^0.12", features = ["json", "blocking"] }
+reqwest = { version = "^0.13", features = ["json", "blocking"] }
 serde_json = "1.0.149"
 solana-client = "~4.3.2"
 solana-commitment-config = "3.1"
