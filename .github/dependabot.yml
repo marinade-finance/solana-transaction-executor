@@ -26,3 +26,7 @@ updates:
     directory: '/'
     schedule:
       interval: 'monthly'
+    ignore:
+      # solana majors move together, gated by the version solana-client depends on
+      - dependency-name: 'solana-*'
+        update-types: ['version-update:semver-major']
