@@ -175,10 +175,7 @@ impl TransactionExecutor {
                         "RPC error while sending the transaction {attempt_signature}: {err}"
                     );
                 }
-                signatures
-                    .write()
-                    .await
-                    .push(transaction.get_signature().clone());
+                signatures.write().await.push(*transaction.get_signature());
             }
 
             tokio::select! {
@@ -207,7 +204,7 @@ impl TransactionExecutor {
             executed_signature = receiver_transaction_executed.recv() => {
                 if let Some(executed_signature) = executed_signature {
                     log::info!("Transaction {executed_signature} successfully executed!");
-                    return Ok(executed_signature)
+                    Ok(executed_signature)
                 } else {
                     anyhow::bail!("No transaction executed")
                 }
