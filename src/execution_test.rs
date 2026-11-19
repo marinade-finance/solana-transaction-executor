@@ -240,7 +240,7 @@ fn config() -> TransactionExecutorConfig {
         waiting_time_after_last_send: Duration::from_millis(300),
         max_attempts: 3,
         max_consecutive_blockhash_check_failures: 2,
-        blockhash_refresh_interval: Duration::ZERO,
+        block_height_refresh_interval: Duration::ZERO,
         max_sends_per_second: 1_000,
         rebroadcast_interval: None,
         ..TransactionExecutorConfig::default()
@@ -894,4 +894,43 @@ async fn a_sent_before_attempt_is_simulated_even_when_flagged() {
     .await;
 
     assert_eq!(chain.simulated_at.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_blockhash_read_asks_the_rpc() {
+    let chain = Arc::new(Scripted::default());
+    let executor = TransactionExecutor::new(
+        TransactionExecutorConfig::default(),
+        chain.clone(),
+        chain.clone(),
+        chain.clone(),
+        chain.clone(),
+    );
+
+    let first = executor.latest_blockhash().await.unwrap().0;
+    let second = executor.latest_blockhash().await.unwrap().0;
+
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn the_expiry_wait_reads_the_cached_block_height() {
+    let (execution, chain) = execute(
+        Script {
+            block_heights: VecDeque::from([Ok(LAST_VALID)]),
+            ..Script::default()
+        },
+        TransactionExecutorConfig {
+            block_height_refresh_interval: Duration::from_secs(10),
+            ..config()
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(execution.outcome, Outcome::Unknown { .. }),
+        "{:?}",
+        execution.outcome
+    );
+    assert_eq!(chain.sends_at_block_height_reads.lock().unwrap().len(), 1);
 }

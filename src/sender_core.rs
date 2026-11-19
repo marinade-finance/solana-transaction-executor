@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, VecDeque},
-    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -8,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use solana_hash::Hash;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -17,6 +15,7 @@ use tokio::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot, Mutex,
     },
+    task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 
@@ -27,6 +26,7 @@ use crate::{
 
 /// The protocol maximum of one `getSignatureStatuses` call.
 const MAX_STATUSES_PER_CALL: usize = 256;
+const MIN_PERIOD: Duration = Duration::from_millis(1);
 
 pub(crate) struct Landing {
     pub(crate) signature: Signature,
@@ -63,52 +63,48 @@ struct Broadcast {
     queued: bool,
 }
 
-type Cached<T> = Mutex<Option<(T, Instant)>>;
-
-struct Chain {
+struct Height {
     statuses: Arc<dyn SignatureStatusesProvider + Send + Sync>,
     refresh: Duration,
-    blockhash: Cached<(Hash, u64)>,
-    block_height: Cached<u64>,
+    cached: Mutex<Option<(u64, Instant)>>,
 }
 
-impl Chain {
-    async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
-        cached(
-            &self.blockhash,
-            self.refresh,
-            self.statuses.latest_blockhash(),
-        )
-        .await
+impl Height {
+    async fn read(&self) -> anyhow::Result<u64> {
+        let mut cached = self.cached.lock().await;
+        if let Some((height, read_at)) = *cached {
+            if read_at.elapsed() < self.refresh {
+                return Ok(height);
+            }
+        }
+        let height = self.statuses.block_height().await?;
+        *cached = Some((height, Instant::now()));
+        Ok(height)
     }
+}
 
-    async fn block_height(&self) -> anyhow::Result<u64> {
-        cached(
-            &self.block_height,
-            self.refresh,
-            self.statuses.block_height(),
-        )
-        .await
-    }
+struct Polled {
+    landed: Vec<(u64, Landing)>,
+    height: Option<u64>,
 }
 
 struct Loop {
-    chain: Arc<Chain>,
+    height: Arc<Height>,
     send: Arc<dyn SendTransactionProvider + Send + Sync>,
     status_interval: Duration,
     send_interval: Duration,
     rebroadcast_interval: Option<Duration>,
 }
 
-/// The executor's shared state: one cache for every execution, so parallel ones share RPC reads.
+/// The executor's shared state: one loop and one block height for every execution.
 pub(crate) struct SenderCore {
-    chain: Arc<Chain>,
+    core_loop: OnceLock<UnboundedSender<Command>>,
+    height: Arc<Height>,
     send: Arc<dyn SendTransactionProvider + Send + Sync>,
     status_interval: Duration,
     send_interval: Duration,
     rebroadcast_interval: Option<Duration>,
     executions: AtomicU64,
-    commands: OnceLock<UnboundedSender<Command>>,
 }
 
 impl SenderCore {
@@ -118,27 +114,27 @@ impl SenderCore {
         send: Arc<dyn SendTransactionProvider + Send + Sync>,
     ) -> Self {
         Self {
-            chain: Arc::new(Chain {
+            core_loop: OnceLock::new(),
+            height: Arc::new(Height {
                 statuses,
-                refresh: config.blockhash_refresh_interval,
-                blockhash: Mutex::new(None),
-                block_height: Mutex::new(None),
+                refresh: config.block_height_refresh_interval,
+                cached: Mutex::new(None),
             }),
             send,
-            status_interval: config.signature_status_check_interval,
-            send_interval: Duration::from_secs(1) / config.max_sends_per_second.max(1),
+            status_interval: config.signature_status_check_interval.max(MIN_PERIOD),
+            send_interval: (Duration::from_secs(1) / config.max_sends_per_second.max(1))
+                .max(MIN_PERIOD),
             rebroadcast_interval: config.rebroadcast_interval,
             executions: AtomicU64::new(0),
-            commands: OnceLock::new(),
         }
     }
 
-    /// The loop starts on the first command; a stopped loop closes every execution's landings.
+    /// The loop starts on the first command.
     fn send(&self, command: Command) {
-        let commands = self.commands.get_or_init(|| {
+        let commands = self.core_loop.get_or_init(|| {
             let (commands, receiver) = mpsc::unbounded_channel();
             let core_loop = Loop {
-                chain: self.chain.clone(),
+                height: self.height.clone(),
                 send: self.send.clone(),
                 status_interval: self.status_interval,
                 send_interval: self.send_interval,
@@ -189,30 +185,16 @@ impl SenderCore {
             .unwrap_or_else(|_| Some("The sender core stopped".into()))
     }
 
-    pub(crate) async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
-        self.chain.latest_blockhash().await
-    }
-
     /// A stale height is lower than the real one, so it can only hold a retry longer.
     pub(crate) async fn block_height(&self) -> anyhow::Result<u64> {
-        self.chain.block_height().await
+        self.height.read().await
     }
 }
 
-async fn cached<T: Copy>(
-    slot: &Cached<T>,
-    refresh: Duration,
-    read: impl Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    let mut cached = slot.lock().await;
-    if let Some((value, read_at)) = *cached {
-        if read_at.elapsed() < refresh {
-            return Ok(value);
-        }
+fn watch(pending: &mut Vec<(Signature, u64)>, signature: Signature, execution: u64) {
+    if !pending.contains(&(signature, execution)) {
+        pending.push((signature, execution));
     }
-    let value = read.await?;
-    *cached = Some((value, Instant::now()));
-    Ok(value)
 }
 
 impl Loop {
@@ -222,6 +204,8 @@ impl Loop {
         let mut broadcasts: HashMap<Signature, Broadcast> = HashMap::new();
         let mut first_sends: VecDeque<Queued> = VecDeque::new();
         let mut rebroadcasts: VecDeque<Signature> = VecDeque::new();
+        let mut polling: Option<JoinHandle<Polled>> = None;
+        let mut polled_executions: Vec<u64> = Vec::new();
         let interval = self.status_interval;
         let mut tick = tokio::time::interval_at(Instant::now() + interval, interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -236,19 +220,16 @@ impl Loop {
                         executions.insert(execution, landings);
                     }
                     Some(Command::Watch { execution, signature }) => {
-                        if !pending.contains(&(signature, execution)) {
-                            pending.push((signature, execution));
-                        }
+                        watch(&mut pending, signature, execution);
                     }
                     Some(Command::Send(send)) => first_sends.push_back(send),
                     None => return,
                 },
                 _ = send_tick.tick(), if sendable => {
+                    first_sends.retain(|send| !send.sent.is_closed());
                     if let Some(send) = first_sends.pop_front() {
                         let signature = send.transaction.signatures[0];
-                        if !pending.contains(&(signature, send.execution)) {
-                            pending.push((signature, send.execution));
-                        }
+                        watch(&mut pending, signature, send.execution);
                         broadcasts.insert(signature, Broadcast {
                             transaction: send.transaction.clone(),
                             attempt: send.attempt,
@@ -284,46 +265,73 @@ impl Loop {
                         }
                     }
                 }
-                _ = tick.tick() => {
-                    executions.retain(|_, landings| !landings.is_closed());
-                    pending.retain(|(_, execution)| executions.contains_key(execution));
-                    poll(self.chain.statuses.as_ref(), &pending, &mut executions).await;
+                joined = async { polling.as_mut().expect("guarded by is_some").await }, if polling.is_some() => {
+                    polling = None;
+                    let polled = match joined {
+                        Ok(polled) => polled,
+                        Err(err) => {
+                            log::error!("The status poll stopped: {err}");
+                            for execution in polled_executions.drain(..) {
+                                executions.remove(&execution);
+                            }
+                            continue;
+                        }
+                    };
+                    for (execution, landing) in polled.landed {
+                        report(&mut executions, execution, landing);
+                    }
                     pending.retain(|(_, execution)| executions.contains_key(execution));
                     broadcasts.retain(|signature, _| {
                         pending.iter().any(|(pending, _)| pending == signature)
                     });
                     rebroadcasts.retain(|signature| broadcasts.contains_key(signature));
-                    self.queue_rebroadcasts(&mut broadcasts, &mut rebroadcasts).await;
+                    if let Some(height) = polled.height {
+                        self.queue_rebroadcasts(height, &mut broadcasts, &mut rebroadcasts);
+                    }
+                    polled_executions.clear();
+                }
+                _ = tick.tick(), if polling.is_none() => {
+                    executions.retain(|_, landings| !landings.is_closed());
+                    pending.retain(|(_, execution)| executions.contains_key(execution));
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    polled_executions = pending.iter().map(|(_, execution)| *execution).collect();
+                    let read_height = self.rebroadcast_interval.is_some_and(|every| {
+                        broadcasts.values().any(|broadcast| broadcast.last_sent.elapsed() >= every)
+                    });
+                    polling = Some(tokio::spawn(poll(
+                        self.height.clone(),
+                        pending.clone(),
+                        read_height,
+                    )));
                 }
             }
         }
     }
 
-    async fn queue_rebroadcasts(
+    /// Drops queued rebroadcasts past their validity and queues the due ones still valid.
+    fn queue_rebroadcasts(
         &self,
+        height: u64,
         broadcasts: &mut HashMap<Signature, Broadcast>,
         rebroadcasts: &mut VecDeque<Signature>,
     ) {
         let Some(every) = self.rebroadcast_interval else {
             return;
         };
-        let due =
-            |broadcast: &Broadcast| !broadcast.queued && broadcast.last_sent.elapsed() >= every;
-        if !broadcasts.values().any(due) {
-            return;
-        }
-        let height = match self.chain.block_height().await {
-            Ok(height) => height,
-            Err(err) => {
-                log::warn!(
-                    "No rebroadcast this round, the block height read failed: {}",
-                    redact_urls(&err.to_string())
-                );
-                return;
-            }
-        };
+        rebroadcasts.retain(|signature| {
+            let broadcast = broadcasts
+                .get_mut(signature)
+                .expect("retained with broadcasts");
+            broadcast.queued = height <= broadcast.last_valid_block_height;
+            broadcast.queued
+        });
         for (signature, broadcast) in broadcasts.iter_mut() {
-            if due(broadcast) && height <= broadcast.last_valid_block_height {
+            if !broadcast.queued
+                && broadcast.last_sent.elapsed() >= every
+                && height <= broadcast.last_valid_block_height
+            {
                 broadcast.queued = true;
                 rebroadcasts.push_back(*signature);
             }
@@ -331,14 +339,35 @@ impl Loop {
     }
 }
 
-async fn poll(
-    statuses: &(dyn SignatureStatusesProvider + Send + Sync),
-    pending: &[(Signature, u64)],
+fn report(
     executions: &mut HashMap<u64, UnboundedSender<Landing>>,
+    execution: u64,
+    landing: Landing,
 ) {
+    let Some(landings) = executions.remove(&execution) else {
+        return;
+    };
+    let signature = landing.signature;
+    match &landing.result {
+        Ok(()) => log::info!(
+            "Transaction {signature} landed in the slot {}",
+            landing.slot
+        ),
+        Err(err) => log::error!(
+            "Transaction {signature} landed in the slot {} and failed: {err}",
+            landing.slot
+        ),
+    }
+    if landings.send(landing).is_err() {
+        log::warn!("Channel closed before {signature} was reported");
+    }
+}
+
+async fn poll(height: Arc<Height>, pending: Vec<(Signature, u64)>, read_height: bool) -> Polled {
+    let mut landed = Vec::new();
     for chunk in pending.chunks(MAX_STATUSES_PER_CALL) {
         let signatures: Vec<Signature> = chunk.iter().map(|(signature, _)| *signature).collect();
-        let found = match statuses.get_signature_statuses(&signatures).await {
+        let found = match height.statuses.get_signature_statuses(&signatures).await {
             Ok(response) => response.value,
             Err(err) => {
                 log::error!(
@@ -349,25 +378,28 @@ async fn poll(
             }
         };
         for (status, (signature, execution)) in found.into_iter().zip(chunk) {
-            let Some(status) = status else { continue };
-            let Some(landings) = executions.remove(execution) else {
-                continue;
-            };
-            match &status.status {
-                Ok(()) => log::info!("Transaction {signature} landed in the slot {}", status.slot),
-                Err(err) => log::error!(
-                    "Transaction {signature} landed in the slot {} and failed: {err}",
-                    status.slot
-                ),
-            }
-            let landing = Landing {
-                signature: *signature,
-                slot: status.slot,
-                result: status.status,
-            };
-            if landings.send(landing).is_err() {
-                log::warn!("Channel closed before {signature} was reported");
+            if let Some(status) = status {
+                let landing = Landing {
+                    signature: *signature,
+                    slot: status.slot,
+                    result: status.status,
+                };
+                landed.push((*execution, landing));
             }
         }
     }
+    let height = match read_height {
+        true => match height.read().await {
+            Ok(height) => Some(height),
+            Err(err) => {
+                log::warn!(
+                    "No rebroadcast this round, the block height read failed: {}",
+                    redact_urls(&err.to_string())
+                );
+                None
+            }
+        },
+        false => None,
+    };
+    Polled { landed, height }
 }

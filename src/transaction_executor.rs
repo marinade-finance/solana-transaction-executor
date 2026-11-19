@@ -51,11 +51,11 @@ enum Waited {
     Unknown(String),
 }
 
+/// The sender core copies the send provider and the send knobs at `new()`; set them before.
 pub struct TransactionExecutor {
     pub transaction_executor_config: TransactionExecutorConfig,
     pub signature_statuses_provider: Arc<dyn SignatureStatusesProvider + Send + Sync>,
     pub simulate_transaction_provider: Arc<dyn SimulateTransactionProvider + Send + Sync>,
-    pub send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
     pub prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
     pub(crate) core: Arc<SenderCore>,
 }
@@ -71,13 +71,12 @@ impl TransactionExecutor {
         let core = Arc::new(SenderCore::new(
             &transaction_executor_config,
             signature_statuses_provider.clone(),
-            send_transaction_provider.clone(),
+            send_transaction_provider,
         ));
         Self {
             transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
-            send_transaction_provider,
             prioritization_fees_provider,
             core,
         }

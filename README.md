@@ -51,7 +51,7 @@ next attempt is pulled, so it is never replaced while it may still land. The
 | `max_attempts` | 10 | attempts pulled from the stream |
 | `wait_for_blockhash_expiry_before_retry` | true | rebuild only after the last attempt's expiry is proven |
 | `max_consecutive_blockhash_check_failures` | 5 | failed block height reads before `Unknown` |
-| `blockhash_refresh_interval` | 5s | age of the cached blockhash and block height |
+| `block_height_refresh_interval` | 5s | age of the cached block height |
 | `max_sends_per_second` | 10 | all sends of the executor, first sends and rebroadcasts |
 | `rebroadcast_interval` | 2s | resend of the same bytes until they land or expire; `None` sends once |
 

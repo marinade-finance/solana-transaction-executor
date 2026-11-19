@@ -26,7 +26,6 @@ use crate::{
 
 #[derive(Default)]
 struct Counting {
-    blockhash_reads: AtomicUsize,
     block_height_reads: AtomicUsize,
     fails: AtomicBool,
     status_calls: Mutex<Vec<usize>>,
@@ -38,6 +37,9 @@ struct Counting {
     /// Every send after the first answers `AlreadyProcessed`.
     resends_already_processed: AtomicBool,
     landed: Mutex<HashSet<Signature>>,
+    statuses_delay: Mutex<Duration>,
+    statuses_fail: AtomicBool,
+    statuses_panic: AtomicBool,
 }
 
 #[async_trait]
@@ -74,6 +76,15 @@ impl SignatureStatusesProvider for Counting {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        let delay = *self.statuses_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+        assert!(
+            !self.statuses_panic.load(Ordering::SeqCst),
+            "scripted poll failure"
+        );
+        if self.statuses_fail.load(Ordering::SeqCst) {
+            return Err(solana_client::client_error::ClientErrorKind::Custom("down".into()).into());
+        }
         self.status_calls.lock().unwrap().push(signatures.len());
         self.statuses_seen
             .lock()
@@ -110,9 +121,7 @@ impl SignatureStatusesProvider for Counting {
     }
 
     async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
-        let read = self.blockhash_reads.fetch_add(1, Ordering::SeqCst);
-        anyhow::ensure!(!self.fails.load(Ordering::SeqCst), "the node is down");
-        Ok((Hash::new_from_array([1; 32]), 100 + read as u64))
+        Ok((Hash::new_from_array([1; 32]), 100))
     }
 
     async fn block_height(&self) -> anyhow::Result<u64> {
@@ -159,22 +168,18 @@ fn signatures(count: usize) -> Vec<Signature> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn blockhash_reads_within_the_interval_cost_one_rpc_call() {
+async fn block_height_reads_within_the_interval_cost_one_rpc_call() {
     let chain = Arc::new(Counting::default());
     let core = core(&chain);
 
     for _ in 0..50 {
-        assert_eq!(core.latest_blockhash().await.unwrap().1, 100);
         assert_eq!(core.block_height().await.unwrap(), 0);
         tokio::time::advance(Duration::from_millis(80)).await;
     }
-    assert_eq!(chain.blockhash_reads.load(Ordering::SeqCst), 1);
     assert_eq!(chain.block_height_reads.load(Ordering::SeqCst), 1);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    assert_eq!(core.latest_blockhash().await.unwrap().1, 101);
     assert_eq!(core.block_height().await.unwrap(), 1);
-    assert_eq!(chain.blockhash_reads.load(Ordering::SeqCst), 2);
     assert_eq!(chain.block_height_reads.load(Ordering::SeqCst), 2);
 }
 
@@ -184,11 +189,9 @@ async fn a_failed_refresh_is_an_error_and_the_next_call_retries() {
     let core = core(&chain);
     chain.fails.store(true, Ordering::SeqCst);
 
-    assert!(core.latest_blockhash().await.is_err());
     assert!(core.block_height().await.is_err());
     chain.fails.store(false, Ordering::SeqCst);
 
-    assert_eq!(core.latest_blockhash().await.unwrap().1, 101);
     assert_eq!(core.block_height().await.unwrap(), 1);
 }
 
@@ -319,7 +322,7 @@ async fn a_send_error_is_recorded_and_the_signature_is_still_watched() {
 fn rebroadcasting(rebroadcast_interval: Option<Duration>) -> TransactionExecutorConfig {
     TransactionExecutorConfig {
         rebroadcast_interval,
-        blockhash_refresh_interval: Duration::from_secs(1),
+        block_height_refresh_interval: Duration::from_secs(1),
         ..TransactionExecutorConfig::default()
     }
 }
@@ -457,4 +460,228 @@ async fn a_rebroadcast_repeats_the_attempt_number() {
         .map(|(_, attempt, _)| *attempt)
         .collect();
     assert_eq!(attempts, vec![3; 4]);
+}
+
+fn signature_sends(chain: &Counting, signature: Signature) -> usize {
+    chain
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(sent, _, _)| *sent == signature)
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_status_poll_does_not_stall_the_sends() {
+    let chain = Arc::new(Counting::default());
+    *chain.statuses_delay.lock().unwrap() = Duration::from_millis(800);
+    let core = Arc::new(core_with(&chain, rebroadcasting(None)));
+    let start = Instant::now();
+    let mut receivers = Vec::new();
+    for signature in signatures(30) {
+        let (execution, landings) = core.register();
+        receivers.push(landings);
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.send_transaction(execution, &transaction(signature), 1, 1_000)
+                .await;
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let offsets = send_offsets(&chain, start);
+    assert_eq!(offsets.len(), 30);
+    assert!(offsets[29] < Duration::from_secs(3), "{offsets:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_send_of_a_cancelled_execution_is_not_broadcast() {
+    let chain = Arc::new(Counting::default());
+    let core = Arc::new(core_with(
+        &chain,
+        TransactionExecutorConfig {
+            max_sends_per_second: 1,
+            ..rebroadcasting(None)
+        },
+    ));
+    let [first, cancelled] = signatures(2).try_into().unwrap();
+    let (execution, _landings) = core.register();
+    core.send_transaction(execution, &transaction(first), 1, 1_000)
+        .await;
+    let queued = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.send_transaction(execution, &transaction(cancelled), 2, 1_000)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    queued.abort();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(signature_sends(&chain, first), 1);
+    assert_eq!(signature_sends(&chain, cancelled), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_and_huge_periods_do_not_stop_the_core() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(
+        &chain,
+        TransactionExecutorConfig {
+            signature_status_check_interval: Duration::ZERO,
+            max_sends_per_second: u32::MAX,
+            ..rebroadcasting(None)
+        },
+    );
+    let (execution, _landings) = core.register();
+    let signature = signatures(1)[0];
+
+    let error = core
+        .send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(error, None);
+    assert!(chain.statuses_seen.lock().unwrap().contains(&signature));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_send_rate_counts_as_one_per_second() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(
+        &chain,
+        TransactionExecutorConfig {
+            max_sends_per_second: 0,
+            ..rebroadcasting(None)
+        },
+    );
+    let (execution, _landings) = core.register();
+    let start = Instant::now();
+
+    for signature in signatures(2) {
+        core.send_transaction(execution, &transaction(signature), 1, 1_000)
+            .await;
+    }
+
+    assert_eq!(send_offsets(&chain, start), [0, 1].map(Duration::from_secs));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_poll_ends_only_its_executions() {
+    let chain = Arc::new(Counting::default());
+    chain.statuses_panic.store(true, Ordering::SeqCst);
+    let core = core_with(&chain, rebroadcasting(None));
+    let (execution, mut stopped) = core.register();
+    core.watch(execution, signatures(1)[0]);
+
+    assert!(stopped.recv().await.is_none());
+
+    chain.statuses_panic.store(false, Ordering::SeqCst);
+    let signature = signatures(2)[1];
+    chain.landed.lock().unwrap().insert(signature);
+    let (execution, mut landings) = core.register();
+    core.send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+    assert_eq!(landings.recv().await.unwrap().signature, signature);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_status_call_is_retried_on_the_next_tick() {
+    let chain = Arc::new(Counting::default());
+    chain.statuses_fail.store(true, Ordering::SeqCst);
+    let core = core_with(&chain, rebroadcasting(None));
+    let (execution, mut landings) = core.register();
+    let signature = signatures(1)[0];
+    chain.landed.lock().unwrap().insert(signature);
+    core.watch(execution, signature);
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert!(landings.try_recv().is_err());
+    chain.statuses_fail.store(false, Ordering::SeqCst);
+
+    assert_eq!(landings.recv().await.unwrap().signature, signature);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_height_read_skips_the_rebroadcast() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(&chain, rebroadcasting(Some(Duration::from_secs(2))));
+    let (execution, _landings) = core.register();
+    chain.fails.store(true, Ordering::SeqCst);
+
+    core.send_transaction(execution, &transaction(signatures(1)[0]), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(chain.sends.lock().unwrap().len(), 1);
+
+    chain.fails.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(chain.sends.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_sends_go_before_rebroadcasts() {
+    let chain = Arc::new(Counting::default());
+    let core = Arc::new(core_with(
+        &chain,
+        TransactionExecutorConfig {
+            max_sends_per_second: 1,
+            ..rebroadcasting(Some(Duration::from_secs(2)))
+        },
+    ));
+    let all = signatures(4);
+    let mut receivers = Vec::new();
+    for signature in all.clone() {
+        let (execution, landings) = core.register();
+        receivers.push(landings);
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.send_transaction(execution, &transaction(signature), 1, 1_000)
+                .await;
+        });
+    }
+
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+
+    let order: Vec<Signature> = chain
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(signature, _, _)| *signature)
+        .collect();
+    assert_eq!(order, vec![all[0], all[1], all[2], all[3], all[0]]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_rebroadcast_past_its_validity_is_dropped() {
+    let chain = Arc::new(Counting::default());
+    let core = Arc::new(core_with(
+        &chain,
+        TransactionExecutorConfig {
+            max_sends_per_second: 1,
+            ..rebroadcasting(Some(Duration::from_secs(2)))
+        },
+    ));
+    let all = signatures(6);
+    let mut receivers = Vec::new();
+    for (index, signature) in all.iter().copied().enumerate() {
+        let (execution, landings) = core.register();
+        receivers.push(landings);
+        let last_valid = if index == 0 { 1 } else { 1_000 };
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.send_transaction(execution, &transaction(signature), 1, last_valid)
+                .await;
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(signature_sends(&chain, all[0]), 1);
+    assert!(signature_sends(&chain, all[1]) >= 2);
 }
