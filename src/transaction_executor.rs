@@ -25,7 +25,7 @@ pub struct AttemptTransaction {
     pub last_valid_block_height: u64,
     /// It may have been sent already, e.g. by a run that crashed: watched until proven expired.
     pub sent_before: bool,
-    /// The caller simulated this exact message; a fresh attempt then skips the send-time simulation.
+    /// The caller simulated these instructions just before; a fresh attempt skips the send-time one.
     pub simulated: bool,
 }
 
