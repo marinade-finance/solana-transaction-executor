@@ -25,6 +25,8 @@ pub struct AttemptTransaction {
     pub last_valid_block_height: u64,
     /// It may have been sent already, e.g. by a run that crashed: watched until proven expired.
     pub sent_before: bool,
+    /// The caller simulated this exact message; a fresh attempt then skips the send-time simulation.
+    pub simulated: bool,
 }
 
 impl From<Landing> for Outcome {
@@ -104,6 +106,7 @@ impl TransactionExecutor {
                 transaction,
                 last_valid_block_height,
                 sent_before,
+                simulated,
             } = match transaction_build_result {
                 Ok(built) => built,
                 Err(err) => {
@@ -131,58 +134,64 @@ impl TransactionExecutor {
                 last_sent_at = Instant::now();
             }
 
-            let simulation = match self
-                .simulate_transaction_provider
-                .simulate_transaction(&transaction)
-                .await
-            {
-                Ok(response) => response.value,
-                Err(err) => {
-                    attempts.push(record);
-                    stopped = Some(NotLanded::NotSent {
-                        error: redact_urls(&format!("Failed to simulate {signature}: {err}")),
-                    });
-                    break;
-                }
-            };
-
-            let send = match simulation.err.map(TransactionError::from) {
-                None => true,
-                Some(TransactionError::AlreadyProcessed) => {
-                    log::info!("Transaction {signature} has already been processed");
-                    record.sent = true;
-                    attempts.push(record);
-                    if !sent_before {
-                        signatures.push(signature);
-                        self.core.watch(execution, signature);
-                        last_sent_at = Instant::now();
+            let send = if simulated && !sent_before {
+                true
+            } else {
+                let simulation = match self
+                    .simulate_transaction_provider
+                    .simulate_transaction(&transaction)
+                    .await
+                {
+                    Ok(response) => response.value,
+                    Err(err) => {
+                        attempts.push(record);
+                        stopped = Some(NotLanded::NotSent {
+                            error: redact_urls(&format!("Failed to simulate {signature}: {err}")),
+                        });
+                        break;
                     }
-                    break;
-                }
-                Some(TransactionError::BlockhashNotFound) if sent_before => {
-                    log::info!(
-                        "The blockhash of {signature} was not found; holding it until its expiry is proven"
-                    );
-                    false
-                }
-                Some(TransactionError::BlockhashNotFound) => {
-                    log::info!("Simulation of {signature} failed because blockhash was not found");
-                    attempts.push(record);
-                    sleep(self.transaction_executor_config.transaction_send_interval).await;
-                    continue;
-                }
-                Some(error) => {
-                    log::error!(
-                        "Simulation of attempt {signature} refused it: {error}, logs: {:?}",
-                        simulation.logs
-                    );
-                    record.refused = Some(error.clone());
-                    attempts.push(record);
-                    stopped = Some(NotLanded::Refused {
-                        error,
-                        logs: simulation.logs.unwrap_or_default(),
-                    });
-                    break;
+                };
+
+                match simulation.err.map(TransactionError::from) {
+                    None => true,
+                    Some(TransactionError::AlreadyProcessed) => {
+                        log::info!("Transaction {signature} has already been processed");
+                        record.sent = true;
+                        attempts.push(record);
+                        if !sent_before {
+                            signatures.push(signature);
+                            self.core.watch(execution, signature);
+                            last_sent_at = Instant::now();
+                        }
+                        break;
+                    }
+                    Some(TransactionError::BlockhashNotFound) if sent_before => {
+                        log::info!(
+                            "The blockhash of {signature} was not found; holding it until its expiry is proven"
+                        );
+                        false
+                    }
+                    Some(TransactionError::BlockhashNotFound) => {
+                        log::info!(
+                            "Simulation of {signature} failed because blockhash was not found"
+                        );
+                        attempts.push(record);
+                        sleep(self.transaction_executor_config.transaction_send_interval).await;
+                        continue;
+                    }
+                    Some(error) => {
+                        log::error!(
+                            "Simulation of attempt {signature} refused it: {error}, logs: {:?}",
+                            simulation.logs
+                        );
+                        record.refused = Some(error.clone());
+                        attempts.push(record);
+                        stopped = Some(NotLanded::Refused {
+                            error,
+                            logs: simulation.logs.unwrap_or_default(),
+                        });
+                        break;
+                    }
                 }
             };
 

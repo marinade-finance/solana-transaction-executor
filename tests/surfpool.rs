@@ -179,6 +179,7 @@ async fn signed_transfer(
         .unwrap(),
         last_valid_block_height,
         sent_before: false,
+        simulated: false,
     }
 }
 
@@ -274,6 +275,7 @@ async fn a_sent_before_attempt_that_landed_and_expired_is_found_and_no_fresh_one
         transaction: first.transaction.clone(),
         last_valid_block_height: first.last_valid_block_height,
         sent_before: true,
+        simulated: false,
     };
     let landed = executor
         .execute_transaction(stream::iter([Ok(first)]))
@@ -311,6 +313,7 @@ async fn without_sent_before_a_landed_and_expired_attempt_is_sent_twice() {
         transaction: first.transaction.clone(),
         last_valid_block_height: first.last_valid_block_height,
         sent_before: false,
+        simulated: false,
     };
     executor
         .execute_transaction(stream::iter([Ok(first)]))
@@ -376,6 +379,7 @@ async fn a_refused_attempt_is_not_landed_and_not_sent() {
             .unwrap(),
         last_valid_block_height,
         sent_before: false,
+        simulated: false,
     };
 
     let execution = executor
