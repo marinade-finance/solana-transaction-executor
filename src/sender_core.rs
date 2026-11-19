@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -10,16 +10,20 @@ use std::{
 
 use solana_hash::Hash;
 use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
-        Mutex,
+        oneshot, Mutex,
     },
     time::{Instant, MissedTickBehavior},
 };
 
-use crate::{redact::redact_urls, SignatureStatusesProvider, TransactionExecutorConfig};
+use crate::{
+    redact::redact_urls, SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
+    TransactionExecutorConfig,
+};
 
 /// The protocol maximum of one `getSignatureStatuses` call.
 const MAX_STATUSES_PER_CALL: usize = 256;
@@ -39,15 +43,31 @@ enum Command {
         execution: u64,
         signature: Signature,
     },
+    Send(Queued),
+}
+
+struct Queued {
+    execution: u64,
+    transaction: VersionedTransaction,
+    attempt: u32,
+    /// `None` when the RPC took it, else its error with the endpoint's host only.
+    sent: oneshot::Sender<Option<String>>,
+}
+
+#[derive(Clone)]
+struct Providers {
+    statuses: Arc<dyn SignatureStatusesProvider + Send + Sync>,
+    send: Arc<dyn SendTransactionProvider + Send + Sync>,
 }
 
 type Cached<T> = Mutex<Option<(T, Instant)>>;
 
 /// The executor's shared state: one cache for every execution, so parallel ones share RPC reads.
 pub(crate) struct SenderCore {
-    statuses: Arc<dyn SignatureStatusesProvider + Send + Sync>,
+    providers: Providers,
     refresh: Duration,
     status_interval: Duration,
+    send_interval: Duration,
     blockhash: Cached<(Hash, u64)>,
     block_height: Cached<u64>,
     executions: AtomicU64,
@@ -58,11 +78,13 @@ impl SenderCore {
     pub(crate) fn new(
         config: &TransactionExecutorConfig,
         statuses: Arc<dyn SignatureStatusesProvider + Send + Sync>,
+        send: Arc<dyn SendTransactionProvider + Send + Sync>,
     ) -> Self {
         Self {
-            statuses,
+            providers: Providers { statuses, send },
             refresh: config.blockhash_refresh_interval,
             status_interval: config.signature_status_check_interval,
+            send_interval: Duration::from_secs(1) / config.max_sends_per_second.max(1),
             blockhash: Mutex::new(None),
             block_height: Mutex::new(None),
             executions: AtomicU64::new(0),
@@ -74,7 +96,12 @@ impl SenderCore {
     fn send(&self, command: Command) {
         let commands = self.commands.get_or_init(|| {
             let (commands, receiver) = mpsc::unbounded_channel();
-            tokio::spawn(run(self.statuses.clone(), self.status_interval, receiver));
+            tokio::spawn(run(
+                self.providers.clone(),
+                self.status_interval,
+                self.send_interval,
+                receiver,
+            ));
             commands
         });
         let _ = commands.send(command);
@@ -98,11 +125,30 @@ impl SenderCore {
         });
     }
 
+    /// Queued behind every earlier send of the executor; the signature is watched once sent.
+    pub(crate) async fn send_transaction(
+        &self,
+        execution: u64,
+        transaction: &VersionedTransaction,
+        attempt: u32,
+    ) -> Option<String> {
+        let (sent, result) = oneshot::channel();
+        self.send(Command::Send(Queued {
+            execution,
+            transaction: transaction.clone(),
+            attempt,
+            sent,
+        }));
+        result
+            .await
+            .unwrap_or_else(|_| Some("The sender core stopped".into()))
+    }
+
     pub(crate) async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
         cached(
             &self.blockhash,
             self.refresh,
-            self.statuses.latest_blockhash(),
+            self.providers.statuses.latest_blockhash(),
         )
         .await
     }
@@ -112,7 +158,7 @@ impl SenderCore {
         cached(
             &self.block_height,
             self.refresh,
-            self.statuses.block_height(),
+            self.providers.statuses.block_height(),
         )
         .await
     }
@@ -135,14 +181,18 @@ async fn cached<T: Copy>(
 }
 
 async fn run(
-    statuses: Arc<dyn SignatureStatusesProvider + Send + Sync>,
+    providers: Providers,
     interval: Duration,
+    send_interval: Duration,
     mut commands: UnboundedReceiver<Command>,
 ) {
     let mut executions: HashMap<u64, UnboundedSender<Landing>> = HashMap::new();
     let mut pending: Vec<(Signature, u64)> = Vec::new();
+    let mut queue: VecDeque<Queued> = VecDeque::new();
     let mut tick = tokio::time::interval_at(Instant::now() + interval, interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut send_tick = tokio::time::interval(send_interval);
+    send_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
@@ -155,12 +205,30 @@ async fn run(
                         pending.push((signature, execution));
                     }
                 }
+                Some(Command::Send(send)) => queue.push_back(send),
                 None => return,
             },
+            _ = send_tick.tick(), if !queue.is_empty() => {
+                let Some(send) = queue.pop_front() else { continue };
+                let watched = (send.transaction.signatures[0], send.execution);
+                if !pending.contains(&watched) {
+                    pending.push(watched);
+                }
+                let provider = providers.send.clone();
+                tokio::spawn(async move {
+                    let meta = SendTransactionMeta { attempt: send.attempt };
+                    let error = provider
+                        .send_transaction(&send.transaction, meta)
+                        .await
+                        .err()
+                        .map(|err| redact_urls(&err.to_string()));
+                    let _ = send.sent.send(error);
+                });
+            }
             _ = tick.tick() => {
                 executions.retain(|_, landings| !landings.is_closed());
                 pending.retain(|(_, execution)| executions.contains_key(execution));
-                poll(statuses.as_ref(), &pending, &mut executions).await;
+                poll(providers.statuses.as_ref(), &pending, &mut executions).await;
                 pending.retain(|(_, execution)| executions.contains_key(execution));
             }
         }

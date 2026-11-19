@@ -13,9 +13,8 @@ use tokio::time::{sleep, Instant};
 use crate::{
     redact::redact_urls,
     sender_core::{Landing, SenderCore},
-    Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider, SendTransactionMeta,
-    SendTransactionProvider, SignatureStatusesProvider, SimulateTransactionProvider,
-    TransactionExecutorConfig,
+    Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider, SendTransactionProvider,
+    SignatureStatusesProvider, SimulateTransactionProvider, TransactionExecutorConfig,
 };
 
 pub type TransactionBuilderResult =
@@ -70,6 +69,7 @@ impl TransactionExecutor {
         let core = Arc::new(SenderCore::new(
             &transaction_executor_config,
             signature_statuses_provider.clone(),
+            send_transaction_provider.clone(),
         ));
         Self {
             transaction_executor_config,
@@ -187,19 +187,17 @@ impl TransactionExecutor {
             };
 
             if send {
-                if let Err(err) = self
-                    .send_transaction_provider
-                    .send_transaction(&transaction, SendTransactionMeta { attempt })
+                if let Some(error) = self
+                    .core
+                    .send_transaction(execution, &transaction, attempt)
                     .await
                 {
-                    let error = redact_urls(&err.to_string());
                     log::error!("RPC error while sending the transaction {signature}: {error}");
                     record.send_error = Some(error);
                 }
                 record.sent = true;
                 if !sent_before {
                     signatures.push(signature);
-                    self.core.watch(execution, signature);
                 }
                 last_sent_at = Instant::now();
             }

@@ -10,10 +10,17 @@ use async_trait::async_trait;
 use solana_client::rpc_response::{Response, RpcResponseContext, RpcResult};
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
+use solana_message::{v1, VersionedMessage};
+use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status_client_types::TransactionStatus;
+use tokio::time::Instant;
 
-use crate::{sender_core::SenderCore, SignatureStatusesProvider, TransactionExecutorConfig};
+use crate::{
+    sender_core::SenderCore, SendTransactionMeta, SendTransactionProvider,
+    SignatureStatusesProvider, TransactionExecutorConfig,
+};
 
 #[derive(Default)]
 struct Counting {
@@ -21,6 +28,30 @@ struct Counting {
     block_height_reads: AtomicUsize,
     fails: AtomicBool,
     status_calls: Mutex<Vec<usize>>,
+    /// Signature, attempt and time of every send.
+    sends: Mutex<Vec<(Signature, u32, Instant)>>,
+    sends_fail: AtomicBool,
+    statuses_seen: Mutex<Vec<Signature>>,
+}
+
+#[async_trait]
+impl SendTransactionProvider for Counting {
+    async fn send_transaction(
+        &self,
+        transaction: &VersionedTransaction,
+        meta: SendTransactionMeta,
+    ) -> anyhow::Result<Signature> {
+        let signature = transaction.signatures[0];
+        self.sends
+            .lock()
+            .unwrap()
+            .push((signature, meta.attempt, Instant::now()));
+        anyhow::ensure!(
+            !self.sends_fail.load(Ordering::SeqCst),
+            "error sending request for url (https://rpc.example.com/?api-key=SECRET)"
+        );
+        Ok(signature)
+    }
 }
 
 #[async_trait]
@@ -30,6 +61,10 @@ impl SignatureStatusesProvider for Counting {
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>> {
         self.status_calls.lock().unwrap().push(signatures.len());
+        self.statuses_seen
+            .lock()
+            .unwrap()
+            .extend_from_slice(signatures);
         Ok(Response {
             context: RpcResponseContext {
                 slot: 1,
@@ -64,7 +99,25 @@ impl SignatureStatusesProvider for Counting {
 }
 
 fn core(chain: &Arc<Counting>) -> SenderCore {
-    SenderCore::new(&TransactionExecutorConfig::default(), chain.clone())
+    core_with(chain, TransactionExecutorConfig::default())
+}
+
+fn core_with(chain: &Arc<Counting>, config: TransactionExecutorConfig) -> SenderCore {
+    SenderCore::new(&config, chain.clone(), chain.clone())
+}
+
+fn transaction(signature: Signature) -> VersionedTransaction {
+    let message = v1::Message::try_compile_with_config(
+        &Pubkey::new_unique(),
+        &[],
+        Hash::new_unique(),
+        v1::TransactionConfig::empty(),
+    )
+    .unwrap();
+    VersionedTransaction {
+        signatures: vec![signature],
+        message: VersionedMessage::V1(message),
+    }
 }
 
 fn signatures(count: usize) -> Vec<Signature> {
@@ -174,4 +227,63 @@ async fn a_finished_execution_is_no_longer_polled() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     assert_eq!(chain.status_calls.lock().unwrap().len(), polled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_sends_are_spaced_by_the_rate() {
+    let chain = Arc::new(Counting::default());
+    let core = Arc::new(core(&chain));
+    let sends = signatures(30).into_iter().map(|signature| {
+        let core = core.clone();
+        tokio::spawn(async move {
+            let (execution, landings) = core.register();
+            let error = core
+                .send_transaction(execution, &transaction(signature), 1)
+                .await;
+            drop(landings);
+            error
+        })
+    });
+    for send in futures_util::future::join_all(sends).await {
+        assert_eq!(send.unwrap(), None);
+    }
+
+    let times: Vec<Instant> = chain
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, at)| *at)
+        .collect();
+    assert_eq!(times.len(), 30);
+    for pair in times.windows(2) {
+        assert!(pair[1] - pair[0] >= Duration::from_millis(100), "{pair:?}");
+    }
+    for (index, start) in times.iter().enumerate() {
+        let in_window = times[index..]
+            .iter()
+            .take_while(|at| **at - *start < Duration::from_secs(1))
+            .count();
+        assert!(in_window <= 10, "{in_window} sends within 1s");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_error_is_recorded_and_the_signature_is_still_watched() {
+    let chain = Arc::new(Counting::default());
+    chain.sends_fail.store(true, Ordering::SeqCst);
+    let core = core(&chain);
+    let (execution, _landings) = core.register();
+    let signature = signatures(1)[0];
+
+    let error = core
+        .send_transaction(execution, &transaction(signature), 1)
+        .await;
+
+    assert_eq!(
+        error.as_deref(),
+        Some("error sending request for url (https://rpc.example.com/<redacted>)")
+    );
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(*chain.statuses_seen.lock().unwrap(), vec![signature]);
 }
