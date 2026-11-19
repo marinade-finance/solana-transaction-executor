@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -13,13 +13,14 @@ use solana_hash::Hash;
 use solana_signature::Signature;
 use solana_transaction_status_client_types::TransactionStatus;
 
-use crate::{sender_core::SenderCore, SignatureStatusesProvider};
+use crate::{sender_core::SenderCore, SignatureStatusesProvider, TransactionExecutorConfig};
 
 #[derive(Default)]
 struct Counting {
     blockhash_reads: AtomicUsize,
     block_height_reads: AtomicUsize,
     fails: AtomicBool,
+    status_calls: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -28,6 +29,7 @@ impl SignatureStatusesProvider for Counting {
         &self,
         signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.status_calls.lock().unwrap().push(signatures.len());
         Ok(Response {
             context: RpcResponseContext {
                 slot: 1,
@@ -39,9 +41,9 @@ impl SignatureStatusesProvider for Counting {
 
     async fn get_signature_statuses_with_history(
         &self,
-        signatures: &[Signature],
+        _signatures: &[Signature],
     ) -> RpcResult<Vec<Option<TransactionStatus>>> {
-        self.get_signature_statuses(signatures).await
+        unreachable!("the core reads no history")
     }
 
     async fn latest_blockhash(&self) -> anyhow::Result<(Hash, u64)> {
@@ -62,7 +64,17 @@ impl SignatureStatusesProvider for Counting {
 }
 
 fn core(chain: &Arc<Counting>) -> SenderCore {
-    SenderCore::new(chain.clone(), Duration::from_secs(5))
+    SenderCore::new(&TransactionExecutorConfig::default(), chain.clone())
+}
+
+fn signatures(count: usize) -> Vec<Signature> {
+    (0..count)
+        .map(|n| {
+            let mut bytes = [0; 64];
+            bytes[..8].copy_from_slice(&(n as u64 + 1).to_le_bytes());
+            Signature::from(bytes)
+        })
+        .collect()
 }
 
 #[tokio::test(start_paused = true)]
@@ -97,4 +109,69 @@ async fn a_failed_refresh_is_an_error_and_the_next_call_retries() {
 
     assert_eq!(core.latest_blockhash().await.unwrap().1, 101);
     assert_eq!(core.block_height().await.unwrap(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn six_hundred_pending_signatures_are_polled_in_three_calls() {
+    let chain = Arc::new(Counting::default());
+    let core = core(&chain);
+    let (execution, _landings) = core.register();
+    for signature in signatures(600) {
+        core.watch(execution, signature);
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    assert_eq!(*chain.status_calls.lock().unwrap(), vec![256, 256, 88]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_poll_rate_does_not_depend_on_the_pending_count() {
+    let mut calls = Vec::new();
+    for count in [1, 200] {
+        let chain = Arc::new(Counting::default());
+        let core = core(&chain);
+        let (execution, _landings) = core.register();
+        for signature in signatures(count) {
+            core.watch(execution, signature);
+        }
+
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
+
+        let status_calls = chain.status_calls.lock().unwrap().clone();
+        assert!(
+            status_calls.iter().all(|size| *size == count),
+            "{status_calls:?}"
+        );
+        calls.push(status_calls.len());
+    }
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[0], 10);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nothing_pending_polls_nothing() {
+    let chain = Arc::new(Counting::default());
+    let core = core(&chain);
+    let (_execution, _landings) = core.register();
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert!(chain.status_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_execution_is_no_longer_polled() {
+    let chain = Arc::new(Counting::default());
+    let core = core(&chain);
+    let (execution, landings) = core.register();
+    core.watch(execution, signatures(1)[0]);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let polled = chain.status_calls.lock().unwrap().len();
+    assert_eq!(polled, 2);
+
+    drop(landings);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(chain.status_calls.lock().unwrap().len(), polled);
 }

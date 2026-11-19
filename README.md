@@ -2,7 +2,8 @@
 
 Sends one transaction until it lands or it is proven it did not. Each attempt comes from a stream
 the caller builds (`AttemptTransaction`: the signed transaction, its blockhash's last valid block
-height and `sent_before`), is simulated, then sent; a watcher polls the signatures of every attempt.
+height and `sent_before`), is simulated, then sent; one loop per executor polls the signatures of every execution, up to 256
+per call.
 A caller resuming after a crash yields its persisted attempts first with `sent_before`: each is
 watched, resent as is while its blockhash is valid, and held until its expiry is proven before the
 next attempt is pulled, so it is never replaced while it may still land. The
