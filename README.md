@@ -38,5 +38,23 @@ next attempt is pulled, so it is never replaced while it may still land. The
   accounts. The rate is in
   micro-lamports per CU; `priority_fee_lamports` turns it into the total a v1 `priority_fee` takes.
 
+`TransactionExecutorConfig` defaults are slow and cheap:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `signature_status_check_interval` | 1s | status and expiry check period |
+| `transaction_send_interval` | 20s | pause before the next attempt when not waiting for expiry |
+| `waiting_time_after_last_send` | 120s | bound after which a still-valid attempt is `Unknown` |
+| `max_attempts` | 10 | attempts pulled from the stream |
+| `wait_for_blockhash_expiry_before_retry` | true | rebuild only after the last attempt's expiry is proven |
+| `max_consecutive_blockhash_check_failures` | 5 | failed block height reads before `Unknown` |
+| `blockhash_refresh_interval` | 5s | age of the cached blockhash and block height |
+| `max_sends_per_second` | 10 | all sends of the executor, first sends and rebroadcasts |
+| `rebroadcast_interval` | 2s | resend of the same bytes until they land or expire; `None` sends once |
+
+`wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it re-signs every
+`transaction_send_interval` with `FeePolicy::next` without waiting for expiry, so two attempts can
+both land. Use it for idempotent instructions only.
+
 Tests against a local Surfpool 1.6.1 (offline, 50 ms slots) are ignored by default:
 `SURFPOOL=<binary> cargo test --test surfpool -- --ignored`.

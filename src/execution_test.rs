@@ -240,6 +240,9 @@ fn config() -> TransactionExecutorConfig {
         waiting_time_after_last_send: Duration::from_millis(300),
         max_attempts: 3,
         max_consecutive_blockhash_check_failures: 2,
+        blockhash_refresh_interval: Duration::ZERO,
+        max_sends_per_second: 1_000,
+        rebroadcast_interval: None,
         ..TransactionExecutorConfig::default()
     }
 }
