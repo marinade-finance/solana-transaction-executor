@@ -14,9 +14,9 @@ use tokio::{
 };
 
 use crate::{
-    redact::redact_urls, Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider,
-    SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
-    SimulateTransactionProvider, TransactionExecutorConfig,
+    redact::redact_urls, sender_core::SenderCore, Attempt, Execution, NotLanded, Outcome,
+    PrioritizationFeesProvider, SendTransactionMeta, SendTransactionProvider,
+    SignatureStatusesProvider, SimulateTransactionProvider, TransactionExecutorConfig,
 };
 
 pub type TransactionBuilderResult =
@@ -63,6 +63,7 @@ pub struct TransactionExecutor {
     pub simulate_transaction_provider: Arc<dyn SimulateTransactionProvider + Send + Sync>,
     pub send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
     pub prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
+    pub(crate) core: Arc<SenderCore>,
 }
 
 impl TransactionExecutor {
@@ -73,12 +74,17 @@ impl TransactionExecutor {
         send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
         prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
     ) -> Self {
+        let core = Arc::new(SenderCore::new(
+            signature_statuses_provider.clone(),
+            transaction_executor_config.blockhash_refresh_interval,
+        ));
         Self {
             transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
             send_transaction_provider,
             prioritization_fees_provider,
+            core,
         }
     }
 
@@ -364,7 +370,7 @@ impl TransactionExecutor {
                 _ = sleep(interval) => {}
             }
             if hold_until_expiry {
-                match self.signature_statuses_provider.block_height().await {
+                match self.core.block_height().await {
                     Ok(height) if height <= last.last_valid_block_height => {
                         block_height_failures = 0;
                         if sent_at.elapsed() >= bound {

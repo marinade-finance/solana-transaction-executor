@@ -16,8 +16,9 @@ pub struct Simulation {
 }
 
 impl TransactionExecutor {
+    /// Served from a cache younger than `blockhash_refresh_interval`.
     pub async fn latest_blockhash(&self) -> anyhow::Result<(solana_hash::Hash, u64)> {
-        self.signature_statuses_provider.latest_blockhash().await
+        self.core.latest_blockhash().await
     }
 
     /// Simulates without signatures, against the latest blockhash; an unset v1 limit runs at the max.
