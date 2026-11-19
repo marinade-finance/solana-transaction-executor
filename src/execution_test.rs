@@ -791,3 +791,32 @@ fn a_status_at_the_commitment_wins_over_an_earlier_one_below_it() {
         None
     );
 }
+
+#[tokio::test]
+async fn a_rebroadcast_that_lands_adds_no_attempt() {
+    let (execution, chain) = execute(
+        Script {
+            landings: VecDeque::from([None, Some(Ok(()))]),
+            block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
+            ..Script::default()
+        },
+        TransactionExecutorConfig {
+            rebroadcast_interval: Some(Duration::from_millis(10)),
+            ..config()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 11,
+        }
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert_eq!(
+        *chain.sent.lock().unwrap(),
+        vec![Signature::from([1; 64]); 2]
+    );
+}

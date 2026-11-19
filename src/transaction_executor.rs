@@ -189,7 +189,7 @@ impl TransactionExecutor {
             if send {
                 if let Some(error) = self
                     .core
-                    .send_transaction(execution, &transaction, attempt)
+                    .send_transaction(execution, &transaction, attempt, last_valid_block_height)
                     .await
                 {
                     log::error!("RPC error while sending the transaction {signature}: {error}");

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -14,7 +15,8 @@ use solana_message::{v1, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
-use solana_transaction_status_client_types::TransactionStatus;
+use solana_transaction_error::TransactionError;
+use solana_transaction_status_client_types::{TransactionConfirmationStatus, TransactionStatus};
 use tokio::time::Instant;
 
 use crate::{
@@ -32,6 +34,10 @@ struct Counting {
     sends: Mutex<Vec<(Signature, u32, Instant)>>,
     sends_fail: AtomicBool,
     statuses_seen: Mutex<Vec<Signature>>,
+    sent_transactions: Mutex<Vec<VersionedTransaction>>,
+    /// Every send after the first answers `AlreadyProcessed`.
+    resends_already_processed: AtomicBool,
+    landed: Mutex<HashSet<Signature>>,
 }
 
 #[async_trait]
@@ -42,10 +48,18 @@ impl SendTransactionProvider for Counting {
         meta: SendTransactionMeta,
     ) -> anyhow::Result<Signature> {
         let signature = transaction.signatures[0];
-        self.sends
+        let index = {
+            let mut sends = self.sends.lock().unwrap();
+            sends.push((signature, meta.attempt, Instant::now()));
+            sends.len() - 1
+        };
+        self.sent_transactions
             .lock()
             .unwrap()
-            .push((signature, meta.attempt, Instant::now()));
+            .push(transaction.clone());
+        if index > 0 && self.resends_already_processed.load(Ordering::SeqCst) {
+            anyhow::bail!("{}", TransactionError::AlreadyProcessed);
+        }
         anyhow::ensure!(
             !self.sends_fail.load(Ordering::SeqCst),
             "error sending request for url (https://rpc.example.com/?api-key=SECRET)"
@@ -70,7 +84,21 @@ impl SignatureStatusesProvider for Counting {
                 slot: 1,
                 api_version: None,
             },
-            value: vec![None; signatures.len()],
+            value: {
+                let landed = self.landed.lock().unwrap();
+                signatures
+                    .iter()
+                    .map(|signature| {
+                        landed.contains(signature).then_some(TransactionStatus {
+                            slot: 7,
+                            confirmations: None,
+                            status: Ok(()),
+                            err: None,
+                            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                        })
+                    })
+                    .collect()
+            },
         })
     }
 
@@ -238,7 +266,7 @@ async fn first_sends_are_spaced_by_the_rate() {
         tokio::spawn(async move {
             let (execution, landings) = core.register();
             let error = core
-                .send_transaction(execution, &transaction(signature), 1)
+                .send_transaction(execution, &transaction(signature), 1, 1_000)
                 .await;
             drop(landings);
             error
@@ -277,7 +305,7 @@ async fn a_send_error_is_recorded_and_the_signature_is_still_watched() {
     let signature = signatures(1)[0];
 
     let error = core
-        .send_transaction(execution, &transaction(signature), 1)
+        .send_transaction(execution, &transaction(signature), 1, 1_000)
         .await;
 
     assert_eq!(
@@ -286,4 +314,147 @@ async fn a_send_error_is_recorded_and_the_signature_is_still_watched() {
     );
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert_eq!(*chain.statuses_seen.lock().unwrap(), vec![signature]);
+}
+
+fn rebroadcasting(rebroadcast_interval: Option<Duration>) -> TransactionExecutorConfig {
+    TransactionExecutorConfig {
+        rebroadcast_interval,
+        blockhash_refresh_interval: Duration::from_secs(1),
+        ..TransactionExecutorConfig::default()
+    }
+}
+
+fn send_offsets(chain: &Counting, start: Instant) -> Vec<Duration> {
+    chain
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, at)| *at - start)
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unlanded_transaction_is_sent_again_every_two_seconds() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(&chain, rebroadcasting(Some(Duration::from_secs(2))));
+    let (execution, _landings) = core.register();
+    let start = Instant::now();
+
+    core.send_transaction(execution, &transaction(signatures(1)[0]), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_millis(6_500)).await;
+
+    assert_eq!(
+        send_offsets(&chain, start),
+        [0, 2, 4, 6].map(Duration::from_secs)
+    );
+    let sent = chain.sent_transactions.lock().unwrap();
+    assert!(sent.iter().all(|transaction| *transaction == sent[0]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rebroadcast_stops_past_the_last_valid_block_height() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(&chain, rebroadcasting(Some(Duration::from_secs(2))));
+    let (execution, _landings) = core.register();
+    let start = Instant::now();
+
+    core.send_transaction(execution, &transaction(signatures(1)[0]), 1, 1)
+        .await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    assert_eq!(
+        send_offsets(&chain, start),
+        [0, 2, 4].map(Duration::from_secs)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rebroadcast_off_sends_once() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(&chain, rebroadcasting(None));
+    let (execution, _landings) = core.register();
+
+    core.send_transaction(execution, &transaction(signatures(1)[0]), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    assert_eq!(chain.sends.lock().unwrap().len(), 1);
+    assert_eq!(chain.block_height_reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rebroadcasts_count_against_the_rate() {
+    let chain = Arc::new(Counting::default());
+    let core = Arc::new(core_with(
+        &chain,
+        TransactionExecutorConfig {
+            max_sends_per_second: 5,
+            ..rebroadcasting(Some(Duration::from_secs(2)))
+        },
+    ));
+    let mut receivers = Vec::new();
+    for signature in signatures(20) {
+        let (execution, landings) = core.register();
+        receivers.push(landings);
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.send_transaction(execution, &transaction(signature), 1, 1_000)
+                .await;
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let times = send_offsets(&chain, Instant::now() - Duration::from_secs(20));
+    assert!(times.len() > 40, "{} sends", times.len());
+    for (index, start) in times.iter().enumerate() {
+        let in_window = times[index..]
+            .iter()
+            .take_while(|at| **at - *start < Duration::from_secs(1))
+            .count();
+        assert!(in_window <= 5, "{in_window} sends within 1s");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_processed_rebroadcast_is_landed_once_the_status_shows_it() {
+    let chain = Arc::new(Counting::default());
+    chain
+        .resends_already_processed
+        .store(true, Ordering::SeqCst);
+    let core = core_with(&chain, rebroadcasting(Some(Duration::from_secs(2))));
+    let (execution, mut landings) = core.register();
+    let signature = signatures(1)[0];
+
+    core.send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(chain.sends.lock().unwrap().len(), 2);
+    chain.landed.lock().unwrap().insert(signature);
+
+    let landing = landings.recv().await.unwrap();
+    assert_eq!(landing.signature, signature);
+    assert_eq!(landing.slot, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rebroadcast_repeats_the_attempt_number() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(&chain, rebroadcasting(Some(Duration::from_secs(2))));
+    let (execution, _landings) = core.register();
+
+    core.send_transaction(execution, &transaction(signatures(1)[0]), 3, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    let attempts: Vec<u32> = chain
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, attempt, _)| *attempt)
+        .collect();
+    assert_eq!(attempts, vec![3; 4]);
 }
