@@ -55,9 +55,10 @@ next attempt is pulled, so it is never replaced while it may still land. The
 | `max_sends_per_second` | 10 | all sends of the executor, first sends and rebroadcasts |
 | `rebroadcast_interval` | 2s | resend of the same bytes until they land or expire; `None` sends once |
 
-`wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it re-signs every
-`transaction_send_interval` with `FeePolicy::next` without waiting for expiry, so two attempts can
-both land. Use it for idempotent instructions only.
+`wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it takes the next
+attempt from the stream every `transaction_send_interval` without waiting for expiry, so two
+attempts can both land. The caller signs and prices each attempt (`next_rate`). Use it for
+idempotent instructions only.
 
 Tests against a local Surfpool 1.6.1 (offline, 50 ms slots) are ignored by default:
 `SURFPOOL=<binary> cargo test --test surfpool -- --ignored`.
