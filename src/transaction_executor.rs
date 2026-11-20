@@ -7,16 +7,14 @@ use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::TransactionStatus;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender};
-use tokio::{
-    sync::RwLock,
-    time::{sleep, Instant},
-};
+use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
+use tokio::time::{sleep, Instant};
 
 use crate::{
-    redact::redact_urls, Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider,
-    SendTransactionMeta, SendTransactionProvider, SignatureStatusesProvider,
-    SimulateTransactionProvider, TransactionExecutorConfig,
+    redact::redact_urls,
+    sender_core::{Landing, SenderCore},
+    Attempt, Execution, NotLanded, Outcome, PrioritizationFeesProvider, SendTransactionProvider,
+    SignatureStatusesProvider, SimulateTransactionProvider, TransactionExecutorConfig,
 };
 
 pub type TransactionBuilderResult =
@@ -27,12 +25,8 @@ pub struct AttemptTransaction {
     pub last_valid_block_height: u64,
     /// It may have been sent already, e.g. by a run that crashed: watched until proven expired.
     pub sent_before: bool,
-}
-
-struct Landing {
-    signature: Signature,
-    slot: u64,
-    result: Result<(), TransactionError>,
+    /// The caller simulated these instructions just before; a fresh attempt skips the send-time one.
+    pub simulated: bool,
 }
 
 impl From<Landing> for Outcome {
@@ -57,12 +51,13 @@ enum Waited {
     Unknown(String),
 }
 
+/// The sender core copies the send provider and the send knobs at `new()`; set them before.
 pub struct TransactionExecutor {
     pub transaction_executor_config: TransactionExecutorConfig,
     pub signature_statuses_provider: Arc<dyn SignatureStatusesProvider + Send + Sync>,
     pub simulate_transaction_provider: Arc<dyn SimulateTransactionProvider + Send + Sync>,
-    pub send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
     pub prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
+    pub(crate) core: Arc<SenderCore>,
 }
 
 impl TransactionExecutor {
@@ -73,69 +68,18 @@ impl TransactionExecutor {
         send_transaction_provider: Arc<dyn SendTransactionProvider + Send + Sync>,
         prioritization_fees_provider: Arc<dyn PrioritizationFeesProvider + Send + Sync>,
     ) -> Self {
+        let core = Arc::new(SenderCore::new(
+            &transaction_executor_config,
+            signature_statuses_provider.clone(),
+            send_transaction_provider,
+        ));
         Self {
             transaction_executor_config,
             signature_statuses_provider,
             simulate_transaction_provider,
-            send_transaction_provider,
             prioritization_fees_provider,
+            core,
         }
-    }
-
-    fn spawn_any_signature_watcher(
-        &self,
-        signatures: Arc<RwLock<Vec<Signature>>>,
-        sender_transaction_landed: UnboundedSender<Landing>,
-    ) {
-        let signature_statuses_provider = self.signature_statuses_provider.clone();
-        let interval = self
-            .transaction_executor_config
-            .signature_status_check_interval;
-        tokio::spawn(async move {
-            while !sender_transaction_landed.is_closed() {
-                sleep(interval).await;
-
-                let pending_signatures = signatures.read().await.clone();
-                if pending_signatures.is_empty() {
-                    continue;
-                }
-                let statuses = match signature_statuses_provider
-                    .get_signature_statuses(&pending_signatures)
-                    .await
-                {
-                    Ok(result) => result.value,
-                    Err(err) => {
-                        log::error!(
-                            "Failed to get transaction signatures statuses: {}",
-                            redact_urls(&err.to_string())
-                        );
-                        continue;
-                    }
-                };
-
-                if let Some((TransactionStatus { slot, status, .. }, signature)) = statuses
-                    .into_iter()
-                    .zip(pending_signatures)
-                    .find_map(|(status, signature)| status.map(|status| (status, signature)))
-                {
-                    match &status {
-                        Ok(()) => log::info!("Transaction {signature} landed in the slot {slot}"),
-                        Err(err) => {
-                            log::error!("Transaction {signature} landed in the slot {slot} and failed: {err}")
-                        }
-                    }
-                    let landing = Landing {
-                        signature,
-                        slot,
-                        result: status,
-                    };
-                    if sender_transaction_landed.send(landing).is_err() {
-                        log::warn!("Channel closed before {signature} was reported");
-                    }
-                    return;
-                }
-            }
-        });
     }
 
     /// Ends only on a landing or with proof of none, unless the bound passes or the RPC fails.
@@ -144,11 +88,8 @@ impl TransactionExecutor {
         transaction_builder: impl Stream<Item = anyhow::Result<AttemptTransaction>>,
     ) -> Execution {
         tokio::pin!(transaction_builder);
-        let signatures = Arc::new(RwLock::new(Vec::<Signature>::new()));
-        let (sender_transaction_landed, mut receiver_transaction_landed) =
-            tokio::sync::mpsc::unbounded_channel::<Landing>();
-
-        self.spawn_any_signature_watcher(signatures.clone(), sender_transaction_landed);
+        let mut signatures = Vec::<Signature>::new();
+        let (execution, mut receiver_transaction_landed) = self.core.register();
 
         let mut attempts = Vec::<Attempt>::new();
         let mut stopped: Option<NotLanded> = None;
@@ -164,6 +105,7 @@ impl TransactionExecutor {
                 transaction,
                 last_valid_block_height,
                 sent_before,
+                simulated,
             } = match transaction_build_result {
                 Ok(built) => built,
                 Err(err) => {
@@ -186,88 +128,94 @@ impl TransactionExecutor {
             };
             if sent_before {
                 log::info!("Attempt {signature} may have been sent before; watching it");
-                signatures.write().await.push(signature);
+                signatures.push(signature);
+                self.core.watch(execution, signature);
                 last_sent_at = Instant::now();
             }
 
-            let simulation = match self
-                .simulate_transaction_provider
-                .simulate_transaction(&transaction)
-                .await
-            {
-                Ok(response) => response.value,
-                Err(err) => {
-                    attempts.push(record);
-                    stopped = Some(NotLanded::NotSent {
-                        error: redact_urls(&format!("Failed to simulate {signature}: {err}")),
-                    });
-                    break;
-                }
-            };
-
-            let send = match simulation.err.map(TransactionError::from) {
-                None => true,
-                Some(TransactionError::AlreadyProcessed) => {
-                    log::info!("Transaction {signature} has already been processed");
-                    record.sent = true;
-                    attempts.push(record);
-                    if !sent_before {
-                        signatures.write().await.push(signature);
-                        last_sent_at = Instant::now();
+            let send = if simulated && !sent_before {
+                true
+            } else {
+                let simulation = match self
+                    .simulate_transaction_provider
+                    .simulate_transaction(&transaction)
+                    .await
+                {
+                    Ok(response) => response.value,
+                    Err(err) => {
+                        attempts.push(record);
+                        stopped = Some(NotLanded::NotSent {
+                            error: redact_urls(&format!("Failed to simulate {signature}: {err}")),
+                        });
+                        break;
                     }
-                    break;
-                }
-                Some(TransactionError::BlockhashNotFound) if sent_before => {
-                    log::info!(
-                        "The blockhash of {signature} was not found; holding it until its expiry is proven"
-                    );
-                    false
-                }
-                Some(TransactionError::BlockhashNotFound) => {
-                    log::info!("Simulation of {signature} failed because blockhash was not found");
-                    attempts.push(record);
-                    sleep(self.transaction_executor_config.transaction_send_interval).await;
-                    continue;
-                }
-                Some(error) => {
-                    log::error!(
-                        "Simulation of attempt {signature} refused it: {error}, logs: {:?}",
-                        simulation.logs
-                    );
-                    record.refused = Some(error.clone());
-                    attempts.push(record);
-                    stopped = Some(NotLanded::Refused {
-                        error,
-                        logs: simulation.logs.unwrap_or_default(),
-                    });
-                    break;
+                };
+
+                match simulation.err.map(TransactionError::from) {
+                    None => true,
+                    Some(TransactionError::AlreadyProcessed) => {
+                        log::info!("Transaction {signature} has already been processed");
+                        record.sent = true;
+                        attempts.push(record);
+                        if !sent_before {
+                            signatures.push(signature);
+                            self.core.watch(execution, signature);
+                            last_sent_at = Instant::now();
+                        }
+                        break;
+                    }
+                    Some(TransactionError::BlockhashNotFound) if sent_before => {
+                        log::info!(
+                            "The blockhash of {signature} was not found; holding it until its expiry is proven"
+                        );
+                        false
+                    }
+                    Some(TransactionError::BlockhashNotFound) => {
+                        log::info!(
+                            "Simulation of {signature} failed because blockhash was not found"
+                        );
+                        attempts.push(record);
+                        sleep(self.transaction_executor_config.transaction_send_interval).await;
+                        continue;
+                    }
+                    Some(error) => {
+                        log::error!(
+                            "Simulation of attempt {signature} refused it: {error}, logs: {:?}",
+                            simulation.logs
+                        );
+                        record.refused = Some(error.clone());
+                        attempts.push(record);
+                        stopped = Some(NotLanded::Refused {
+                            error,
+                            logs: simulation.logs.unwrap_or_default(),
+                        });
+                        break;
+                    }
                 }
             };
 
             if send {
-                if let Err(err) = self
-                    .send_transaction_provider
-                    .send_transaction(&transaction, SendTransactionMeta { attempt })
+                if let Some(error) = self
+                    .core
+                    .send_transaction(execution, &transaction, attempt, last_valid_block_height)
                     .await
                 {
-                    let error = redact_urls(&err.to_string());
                     log::error!("RPC error while sending the transaction {signature}: {error}");
                     record.send_error = Some(error);
                 }
                 record.sent = true;
                 if !sent_before {
-                    signatures.write().await.push(signature);
+                    signatures.push(signature);
                 }
                 last_sent_at = Instant::now();
             }
             attempts.push(record);
 
             // Hold retry until previous attempt's blockhash is invalid, see "Orphaned Revoke Tokens"
-            let sent = signatures.read().await.clone();
             let last = &attempts[attempts.len() - 1];
             match self
                 .wait_for_outcome(
-                    &sent,
+                    &signatures,
                     last,
                     last_sent_at,
                     self.transaction_executor_config
@@ -293,11 +241,10 @@ impl TransactionExecutor {
             }
         }
 
-        let sent = signatures.read().await.clone();
         let outcome = self
             .settle(
                 &attempts,
-                &sent,
+                &signatures,
                 stopped,
                 last_sent_at,
                 &mut receiver_transaction_landed,
@@ -364,7 +311,7 @@ impl TransactionExecutor {
                 _ = sleep(interval) => {}
             }
             if hold_until_expiry {
-                match self.signature_statuses_provider.block_height().await {
+                match self.core.block_height().await {
                     Ok(height) if height <= last.last_valid_block_height => {
                         block_height_failures = 0;
                         if sent_at.elapsed() >= bound {

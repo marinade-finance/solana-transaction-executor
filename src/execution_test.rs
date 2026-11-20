@@ -240,6 +240,9 @@ fn config() -> TransactionExecutorConfig {
         waiting_time_after_last_send: Duration::from_millis(300),
         max_attempts: 3,
         max_consecutive_blockhash_check_failures: 2,
+        block_height_refresh_interval: Duration::ZERO,
+        max_sends_per_second: 1_000,
+        rebroadcast_interval: None,
         ..TransactionExecutorConfig::default()
     }
 }
@@ -262,6 +265,14 @@ fn attempt(n: u8) -> AttemptTransaction {
         },
         last_valid_block_height: LAST_VALID,
         sent_before: false,
+        simulated: false,
+    }
+}
+
+fn simulated(n: u8) -> AttemptTransaction {
+    AttemptTransaction {
+        simulated: true,
+        ..attempt(n)
     }
 }
 
@@ -787,4 +798,139 @@ fn a_status_at_the_commitment_wins_over_an_earlier_one_below_it() {
         best_status(vec![None, None], &sent, CommitmentConfig::finalized()),
         None
     );
+}
+
+#[tokio::test]
+async fn a_rebroadcast_that_lands_adds_no_attempt() {
+    let (execution, chain) = execute(
+        Script {
+            landings: VecDeque::from([None, Some(Ok(()))]),
+            block_heights: VecDeque::from(vec![Ok(LAST_VALID); 1_000]),
+            ..Script::default()
+        },
+        TransactionExecutorConfig {
+            rebroadcast_interval: Some(Duration::from_millis(10)),
+            ..config()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 11,
+        }
+    );
+    assert_eq!(execution.attempts.len(), 1);
+    assert_eq!(
+        *chain.sent.lock().unwrap(),
+        vec![Signature::from([1; 64]); 2]
+    );
+}
+
+#[tokio::test]
+async fn a_simulated_attempt_is_sent_without_a_simulation() {
+    let (execution, chain) = execute_stream(
+        Script {
+            landings: VecDeque::from([Some(Ok(()))]),
+            ..Script::default()
+        },
+        config(),
+        vec![Ok(simulated(1))],
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([1; 64]),
+            slot: 10,
+        }
+    );
+    assert!(chain.simulated_at.lock().unwrap().is_empty());
+    assert_eq!(chain.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_resigned_attempt_is_simulated() {
+    let (execution, chain) = execute_stream(
+        Script {
+            landings: VecDeque::from([None, Some(Ok(()))]),
+            ..Script::default()
+        },
+        config(),
+        vec![Ok(simulated(1)), Ok(attempt(2))],
+    )
+    .await;
+
+    assert_eq!(
+        execution.outcome,
+        Outcome::Landed {
+            signature: Signature::from([2; 64]),
+            slot: 11,
+        }
+    );
+    assert_eq!(chain.simulated_at.lock().unwrap().len(), 1);
+    assert_eq!(
+        *chain.sent.lock().unwrap(),
+        vec![Signature::from([1; 64]), Signature::from([2; 64])]
+    );
+}
+
+#[tokio::test]
+async fn a_sent_before_attempt_is_simulated_even_when_flagged() {
+    let (_execution, chain) = execute_stream(
+        Script {
+            landings: VecDeque::from([Some(Ok(()))]),
+            ..Script::default()
+        },
+        config(),
+        vec![Ok(AttemptTransaction {
+            sent_before: true,
+            ..simulated(1)
+        })],
+    )
+    .await;
+
+    assert_eq!(chain.simulated_at.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_blockhash_read_asks_the_rpc() {
+    let chain = Arc::new(Scripted::default());
+    let executor = TransactionExecutor::new(
+        TransactionExecutorConfig::default(),
+        chain.clone(),
+        chain.clone(),
+        chain.clone(),
+        chain.clone(),
+    );
+
+    let first = executor.latest_blockhash().await.unwrap().0;
+    let second = executor.latest_blockhash().await.unwrap().0;
+
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn the_expiry_wait_reads_the_cached_block_height() {
+    let (execution, chain) = execute(
+        Script {
+            block_heights: VecDeque::from([Ok(LAST_VALID)]),
+            ..Script::default()
+        },
+        TransactionExecutorConfig {
+            block_height_refresh_interval: Duration::from_secs(10),
+            ..config()
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(execution.outcome, Outcome::Unknown { .. }),
+        "{:?}",
+        execution.outcome
+    );
+    assert_eq!(chain.sends_at_block_height_reads.lock().unwrap().len(), 1);
 }

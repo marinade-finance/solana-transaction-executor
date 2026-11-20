@@ -6,6 +6,9 @@ mod fake;
 mod fee_policy;
 mod outcome;
 mod redact;
+mod sender_core;
+#[cfg(test)]
+mod sender_core_test;
 mod simulation;
 mod tip_policy;
 mod transaction_executor;

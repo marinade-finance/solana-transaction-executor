@@ -2,7 +2,10 @@
 
 Sends one transaction until it lands or it is proven it did not. Each attempt comes from a stream
 the caller builds (`AttemptTransaction`: the signed transaction, its blockhash's last valid block
-height and `sent_before`), is simulated, then sent; a watcher polls the signatures of every attempt.
+height, `sent_before` and `simulated`), is simulated, then sent; one loop per executor polls the
+signatures of every execution, up to 256 per call. An attempt marked `simulated` skips that
+simulation unless it is `sent_before`; a re-signed attempt should leave it unset, so the changed
+state is checked before a fee is paid again.
 A caller resuming after a crash yields its persisted attempts first with `sent_before`: each is
 watched, resent as is while its blockhash is valid, and held until its expiry is proven before the
 next attempt is pulled, so it is never replaced while it may still land. The
@@ -37,6 +40,25 @@ next attempt is pulled, so it is never replaced while it may still land. The
   attempt, the first too, to the chosen percentile of the recent fees over the transaction's writable
   accounts. The rate is in
   micro-lamports per CU; `priority_fee_lamports` turns it into the total a v1 `priority_fee` takes.
+
+`TransactionExecutorConfig` defaults are slow and cheap:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `signature_status_check_interval` | 1s | status and expiry check period |
+| `transaction_send_interval` | 20s | pause before the next attempt when not waiting for expiry |
+| `waiting_time_after_last_send` | 120s | bound after which a still-valid attempt is `Unknown` |
+| `max_attempts` | 10 | attempts pulled from the stream |
+| `wait_for_blockhash_expiry_before_retry` | true | rebuild only after the last attempt's expiry is proven |
+| `max_consecutive_blockhash_check_failures` | 5 | failed block height reads before `Unknown` |
+| `block_height_refresh_interval` | 5s | age of the cached block height |
+| `max_sends_per_second` | 10 | all sends of the executor, first sends and rebroadcasts |
+| `rebroadcast_interval` | 2s | resend of the same bytes until they land or expire; `None` sends once |
+
+`wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it takes the next
+attempt from the stream every `transaction_send_interval` without waiting for expiry, so two
+attempts can both land. The caller signs and prices each attempt (`next_rate`). Use it for
+idempotent instructions only.
 
 Tests against a local Surfpool 1.6.1 (offline, 50 ms slots) are ignored by default:
 `SURFPOOL=<binary> cargo test --test surfpool -- --ignored`.
