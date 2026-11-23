@@ -51,8 +51,7 @@ enum Waited {
     Unknown(String),
 }
 
-/// The sender core copies the send and statuses providers and the status, height and send knobs
-/// at `new()`; changes to these fields after `new()` do not reach the running core.
+/// The sender core copies both providers and the send and status knobs at `new()`; set them before.
 pub struct TransactionExecutor {
     pub transaction_executor_config: TransactionExecutorConfig,
     pub signature_statuses_provider: Arc<dyn SignatureStatusesProvider + Send + Sync>,

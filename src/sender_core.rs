@@ -27,6 +27,8 @@ use crate::{
 /// The protocol maximum of one `getSignatureStatuses` call.
 const MAX_STATUSES_PER_CALL: usize = 256;
 const MIN_PERIOD: Duration = Duration::from_millis(1);
+/// A custom statuses provider may have no HTTP timeout; one hung call stalls every execution.
+const STATUS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Keeps `Instant::now() + interval` from overflowing.
 const MAX_STATUS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -79,7 +81,9 @@ impl Height {
                 return Ok(height);
             }
         }
-        let height = self.statuses.block_height().await?;
+        let height = tokio::time::timeout(STATUS_CALL_TIMEOUT, self.statuses.block_height())
+            .await
+            .map_err(|_| anyhow::anyhow!("The block height read timed out"))??;
         *cached = Some((height, Instant::now()));
         Ok(height)
     }
@@ -195,6 +199,17 @@ impl SenderCore {
     }
 }
 
+fn prune(
+    executions: &HashMap<u64, UnboundedSender<Landing>>,
+    pending: &mut Vec<(Signature, u64)>,
+    broadcasts: &mut HashMap<Signature, Broadcast>,
+    rebroadcasts: &mut VecDeque<Signature>,
+) {
+    pending.retain(|(_, execution)| executions.contains_key(execution));
+    broadcasts.retain(|signature, _| pending.iter().any(|(pending, _)| pending == signature));
+    rebroadcasts.retain(|signature| broadcasts.contains_key(signature));
+}
+
 fn watch(pending: &mut Vec<(Signature, u64)>, signature: Signature, execution: u64) {
     if !pending.contains(&(signature, execution)) {
         pending.push((signature, execution));
@@ -284,11 +299,7 @@ impl Loop {
                     for (execution, landing) in polled.landed {
                         report(&mut executions, execution, landing);
                     }
-                    pending.retain(|(_, execution)| executions.contains_key(execution));
-                    broadcasts.retain(|signature, _| {
-                        pending.iter().any(|(pending, _)| pending == signature)
-                    });
-                    rebroadcasts.retain(|signature| broadcasts.contains_key(signature));
+                    prune(&executions, &mut pending, &mut broadcasts, &mut rebroadcasts);
                     if let Some(height) = polled.height {
                         self.queue_rebroadcasts(height, &mut broadcasts, &mut rebroadcasts);
                     }
@@ -296,11 +307,7 @@ impl Loop {
                 }
                 _ = tick.tick(), if polling.is_none() => {
                     executions.retain(|_, landings| !landings.is_closed());
-                    pending.retain(|(_, execution)| executions.contains_key(execution));
-                    broadcasts.retain(|signature, _| {
-                        pending.iter().any(|(pending, _)| pending == signature)
-                    });
-                    rebroadcasts.retain(|signature| broadcasts.contains_key(signature));
+                    prune(&executions, &mut pending, &mut broadcasts, &mut rebroadcasts);
                     if pending.is_empty() {
                         continue;
                     }
@@ -375,9 +382,14 @@ async fn poll(height: Arc<Height>, pending: Vec<(Signature, u64)>, read_height: 
     let mut landed = Vec::new();
     for chunk in pending.chunks(MAX_STATUSES_PER_CALL) {
         let signatures: Vec<Signature> = chunk.iter().map(|(signature, _)| *signature).collect();
-        let found = match height.statuses.get_signature_statuses(&signatures).await {
-            Ok(response) => response.value,
-            Err(err) => {
+        let call = height.statuses.get_signature_statuses(&signatures);
+        let found = match tokio::time::timeout(STATUS_CALL_TIMEOUT, call).await {
+            Ok(Ok(response)) => response.value,
+            Err(_) => {
+                log::error!("Failed to get transaction signatures statuses: timed out");
+                continue;
+            }
+            Ok(Err(err)) => {
                 log::error!(
                     "Failed to get transaction signatures statuses: {}",
                     redact_urls(&err.to_string())

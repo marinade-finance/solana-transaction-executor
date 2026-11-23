@@ -27,6 +27,7 @@ use crate::{
 #[derive(Default)]
 struct Counting {
     block_height_reads: AtomicUsize,
+    block_height_delay: Mutex<Duration>,
     fails: AtomicBool,
     status_calls: Mutex<Vec<usize>>,
     /// Signature, attempt and time of every send.
@@ -125,6 +126,8 @@ impl SignatureStatusesProvider for Counting {
     }
 
     async fn block_height(&self) -> anyhow::Result<u64> {
+        let delay = *self.block_height_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
         let read = self.block_height_reads.fetch_add(1, Ordering::SeqCst);
         anyhow::ensure!(!self.fails.load(Ordering::SeqCst), "the node is down");
         Ok(read as u64)
@@ -703,6 +706,47 @@ async fn a_queued_rebroadcast_past_its_validity_is_dropped() {
 
     assert_eq!(signature_sends(&chain, all[0]), 1);
     assert!(signature_sends(&chain, all[1]) >= 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_statuses_call_does_not_stop_landing_detection() {
+    let chain = Arc::new(Counting::default());
+    *chain.statuses_delay.lock().unwrap() = Duration::from_secs(3600);
+    let core = core_with(
+        &chain,
+        TransactionExecutorConfig {
+            signature_status_check_interval: Duration::from_millis(100),
+            ..TransactionExecutorConfig::default()
+        },
+    );
+    let (execution, mut landings) = core.register();
+    let signature = signatures(1)[0];
+
+    core.send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    *chain.statuses_delay.lock().unwrap() = Duration::ZERO;
+    chain.landed.lock().unwrap().insert(signature);
+
+    let landing = tokio::time::timeout(Duration::from_secs(60), landings.recv())
+        .await
+        .expect("a landing before the hung call returns");
+    assert_eq!(landing.unwrap().signature, signature);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_block_height_read_fails_and_frees_the_cache() {
+    let chain = Arc::new(Counting::default());
+    *chain.block_height_delay.lock().unwrap() = Duration::from_secs(3600);
+    let core = core(&chain);
+
+    let hung = tokio::time::timeout(Duration::from_secs(60), core.block_height())
+        .await
+        .expect("the read gives up before the provider returns");
+    assert!(hung.is_err());
+
+    *chain.block_height_delay.lock().unwrap() = Duration::ZERO;
+    assert!(core.block_height().await.is_ok());
 }
 
 #[tokio::test(start_paused = true)]

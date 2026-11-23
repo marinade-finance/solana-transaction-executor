@@ -58,8 +58,8 @@ next attempt is pulled, so it is never replaced while it may still land. The
 `wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it takes the next
 attempt from the stream every `transaction_send_interval` without waiting for expiry, so two
 attempts can both land. Earlier attempts are still rebroadcast every `rebroadcast_interval` until
-they expire, and they share the `max_sends_per_second` budget. The caller signs and prices each attempt (`next_rate`). Use it for
-idempotent instructions only.
+they expire, and they share the `max_sends_per_second` budget. The caller signs and prices each
+attempt (`next_rate`). Use it for idempotent instructions only.
 
 Tests against a local Surfpool 1.6.1 (offline, 50 ms slots) are ignored by default:
 `SURFPOOL=<binary> cargo test --test surfpool -- --ignored`.
