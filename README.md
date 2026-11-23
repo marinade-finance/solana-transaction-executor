@@ -53,11 +53,11 @@ next attempt is pulled, so it is never replaced while it may still land. The
 | `max_consecutive_blockhash_check_failures` | 5 | failed block height reads before `Unknown` |
 | `block_height_refresh_interval` | 5s | age of the cached block height |
 | `max_sends_per_second` | 10 | all sends of the executor, first sends and rebroadcasts |
-| `rebroadcast_interval` | 2s | resend of the same bytes until they land or expire; `None` sends once |
+| `rebroadcast_interval` | 2s | minimum gap between resends of the same bytes, checked on each status poll, until they land or expire; `None` sends once |
 
 `wait_for_blockhash_expiry_before_retry = false` is the fast, fee-costing mode: it takes the next
 attempt from the stream every `transaction_send_interval` without waiting for expiry, so two
-attempts can both land. Earlier attempts are still rebroadcast every `rebroadcast_interval` until
+attempts can both land. Earlier attempts are still rebroadcast until
 they expire, and they share the `max_sends_per_second` budget. The caller signs and prices each
 attempt (`next_rate`). Use it for idempotent instructions only.
 

@@ -11,7 +11,7 @@ pub struct TransactionExecutorConfig {
     pub block_height_refresh_interval: Duration,
     /// All sends of the executor, first sends and rebroadcasts; 0 counts as 1.
     pub max_sends_per_second: u32,
-    /// Sends the same signed bytes again until they land or expire; `None` sends once.
+    /// Minimum gap between resends of the same signed bytes, checked on each status poll; `None` sends once.
     pub rebroadcast_interval: Option<Duration>,
 }
 

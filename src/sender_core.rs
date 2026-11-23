@@ -75,17 +75,19 @@ struct Height {
 
 impl Height {
     async fn read(&self) -> anyhow::Result<u64> {
-        let mut cached = self.cached.lock().await;
-        if let Some((height, read_at)) = *cached {
-            if read_at.elapsed() < self.refresh {
-                return Ok(height);
+        tokio::time::timeout(STATUS_CALL_TIMEOUT, async {
+            let mut cached = self.cached.lock().await;
+            if let Some((height, read_at)) = *cached {
+                if read_at.elapsed() < self.refresh {
+                    return Ok(height);
+                }
             }
-        }
-        let height = tokio::time::timeout(STATUS_CALL_TIMEOUT, self.statuses.block_height())
-            .await
-            .map_err(|_| anyhow::anyhow!("The block height read timed out"))??;
-        *cached = Some((height, Instant::now()));
-        Ok(height)
+            let height = self.statuses.block_height().await?;
+            *cached = Some((height, Instant::now()));
+            Ok(height)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("The block height read timed out"))?
     }
 }
 

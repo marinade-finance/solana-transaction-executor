@@ -750,6 +750,24 @@ async fn a_hung_block_height_read_fails_and_frees_the_cache() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn concurrent_reads_of_a_hung_block_height_fail_within_one_timeout() {
+    let chain = Arc::new(Counting::default());
+    *chain.block_height_delay.lock().unwrap() = Duration::from_secs(3600);
+    let core = core(&chain);
+
+    let (first, second, third) = tokio::time::timeout(Duration::from_secs(45), async {
+        tokio::join!(
+            core.block_height(),
+            core.block_height(),
+            core.block_height()
+        )
+    })
+    .await
+    .expect("every waiter gives up within one call timeout");
+    assert!(first.is_err() && second.is_err() && third.is_err());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_queued_rebroadcast_of_a_finished_execution_is_not_sent() {
     let chain = Arc::new(Counting::default());
     let core = core_with(
