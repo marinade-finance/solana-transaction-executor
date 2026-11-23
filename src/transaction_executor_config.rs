@@ -7,6 +7,12 @@ pub struct TransactionExecutorConfig {
     pub max_attempts: u32,
     pub wait_for_blockhash_expiry_before_retry: bool,
     pub max_consecutive_blockhash_check_failures: u32,
+    /// How long a read block height is served from the cache.
+    pub block_height_refresh_interval: Duration,
+    /// All sends of the executor, first sends and rebroadcasts; 0 counts as 1.
+    pub max_sends_per_second: u32,
+    /// Minimum gap between resends of the same signed bytes, checked on each status poll; `None` sends once.
+    pub rebroadcast_interval: Option<Duration>,
 }
 
 impl Default for TransactionExecutorConfig {
@@ -18,6 +24,35 @@ impl Default for TransactionExecutorConfig {
             max_attempts: 10,
             wait_for_blockhash_expiry_before_retry: true,
             max_consecutive_blockhash_check_failures: 5,
+            block_height_refresh_interval: Duration::from_secs(5),
+            max_sends_per_second: 10,
+            rebroadcast_interval: Some(Duration::from_secs(2)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_are_slow_and_cheap() {
+        let config = TransactionExecutorConfig::default();
+
+        assert_eq!(
+            config.signature_status_check_interval,
+            Duration::from_secs(1)
+        );
+        assert_eq!(config.transaction_send_interval, Duration::from_secs(20));
+        assert_eq!(
+            config.waiting_time_after_last_send,
+            Duration::from_secs(120)
+        );
+        assert_eq!(config.max_attempts, 10);
+        assert!(config.wait_for_blockhash_expiry_before_retry);
+        assert_eq!(config.max_consecutive_blockhash_check_failures, 5);
+        assert_eq!(config.block_height_refresh_interval, Duration::from_secs(5));
+        assert_eq!(config.max_sends_per_second, 10);
+        assert_eq!(config.rebroadcast_interval, Some(Duration::from_secs(2)));
     }
 }
