@@ -547,6 +547,25 @@ async fn zero_and_huge_periods_do_not_stop_the_core() {
 
     assert_eq!(error, None);
     assert!(chain.statuses_seen.lock().unwrap().contains(&signature));
+    drop(core);
+
+    let core = core_with(
+        &chain,
+        TransactionExecutorConfig {
+            signature_status_check_interval: Duration::MAX,
+            ..rebroadcasting(None)
+        },
+    );
+    let (execution, mut landings) = core.register();
+    let signature = signatures(2)[1];
+    chain.landed.lock().unwrap().insert(signature);
+
+    let error = core
+        .send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+
+    assert_eq!(error, None);
+    assert_eq!(landings.recv().await.unwrap().signature, signature);
 }
 
 #[tokio::test(start_paused = true)]
@@ -684,4 +703,27 @@ async fn a_queued_rebroadcast_past_its_validity_is_dropped() {
 
     assert_eq!(signature_sends(&chain, all[0]), 1);
     assert!(signature_sends(&chain, all[1]) >= 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_rebroadcast_of_a_finished_execution_is_not_sent() {
+    let chain = Arc::new(Counting::default());
+    let core = core_with(
+        &chain,
+        TransactionExecutorConfig {
+            signature_status_check_interval: Duration::from_millis(100),
+            max_sends_per_second: 1,
+            ..rebroadcasting(Some(Duration::from_millis(200)))
+        },
+    );
+    let (execution, landings) = core.register();
+    let signature = signatures(1)[0];
+
+    core.send_transaction(execution, &transaction(signature), 1, 1_000)
+        .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(landings);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(signature_sends(&chain, signature), 1);
 }

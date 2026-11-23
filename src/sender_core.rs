@@ -27,6 +27,8 @@ use crate::{
 /// The protocol maximum of one `getSignatureStatuses` call.
 const MAX_STATUSES_PER_CALL: usize = 256;
 const MIN_PERIOD: Duration = Duration::from_millis(1);
+/// Keeps `Instant::now() + interval` from overflowing.
+const MAX_STATUS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct Landing {
     pub(crate) signature: Signature,
@@ -121,7 +123,9 @@ impl SenderCore {
                 cached: Mutex::new(None),
             }),
             send,
-            status_interval: config.signature_status_check_interval.max(MIN_PERIOD),
+            status_interval: config
+                .signature_status_check_interval
+                .clamp(MIN_PERIOD, MAX_STATUS_INTERVAL),
             send_interval: (Duration::from_secs(1) / config.max_sends_per_second.max(1))
                 .max(MIN_PERIOD),
             rebroadcast_interval: config.rebroadcast_interval,
@@ -293,6 +297,10 @@ impl Loop {
                 _ = tick.tick(), if polling.is_none() => {
                     executions.retain(|_, landings| !landings.is_closed());
                     pending.retain(|(_, execution)| executions.contains_key(execution));
+                    broadcasts.retain(|signature, _| {
+                        pending.iter().any(|(pending, _)| pending == signature)
+                    });
+                    rebroadcasts.retain(|signature| broadcasts.contains_key(signature));
                     if pending.is_empty() {
                         continue;
                     }
